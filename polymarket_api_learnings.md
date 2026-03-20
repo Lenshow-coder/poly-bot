@@ -1,5 +1,7 @@
 # Polymarket API Learnings
 
+Documentation: https://docs.polymarket.com/api-reference/introduction
+
 ## API Structure
 
 Three REST APIs (no GraphQL):
