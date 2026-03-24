@@ -6,6 +6,18 @@ An automated market-taking bot that identifies mispricings on Polymarket by comp
 
 The architecture is **market-plugin based**: a core engine handles Polymarket interaction, execution, and risk management, while each market (e.g., "2026 NHL Stanley Cup Champion") is a self-contained plugin with its own data sources, fair value logic, and trade parameters. Adding a new market means adding a new plugin — no changes to the core.
 
+### Terminology
+
+
+| Term                                                                                                                                     | Meaning                                                                           | Example                         |
+| ---------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- | ------------------------------- |
+| **Event**                                                                                                                                | The overall market grouping on Polymarket                                         | "2026 NHL Stanley Cup Champion" |
+| **Outcome**                                                                                                                              | A single team/option within an event — each outcome has its own YES/NO token pair | "Toronto Maple Leafs"           |
+| **Token**                                                                                                                                | The specific YES or NO contract for an outcome                                    | Leafs YES token, Leafs NO token |
+| **Token ID**                                                                                                                             | The unique identifier for a YES or NO token on the CLOB                           | `abc123`                        |
+| Throughout this document, "market" is used loosely but generally refers to an **event**. When precision matters, we use the terms above. |                                                                                   |                                 |
+
+
 ---
 
 ## Table of Contents
@@ -31,11 +43,25 @@ The architecture is **market-plugin based**: a core engine handles Polymarket in
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
+│                           SCRAPERS                                   │
+│  ┌───────────────────┐  ┌───────────────────┐  ┌────────────────┐   │
+│  │ Scraper A         │  │ Scraper B         │  │ Scraper C      │   │
+│  │ (NHL, NBA)        │  │ (soccer)          │  │ (NFL)          │   │
+│  │ every 60s         │  │ every 300s        │  │ every 120s     │   │
+│  └────────┬──────────┘  └────────┬──────────┘  └───────┬────────┘   │
+│           │                      │                     │            │
+│  Independent async loops — each runs on its own interval            │
+│  Results processed immediately on arrival, no coordination          │
+└───────────┼──────────────────────┼─────────────────────┼────────────┘
+            │                      │                     │
+            ▼                      ▼                     ▼
+┌─────────────────────────────────────────────────────────────────────┐
 │                         MARKET PLUGINS                              │
 │  ┌──────────────────┐  ┌──────────────────┐  ┌─────────────────┐   │
 │  │ NHL Stanley Cup  │  │ NHL Atlantic Div │  │  Future Market   │   │
 │  │                  │  │                  │  │                  │   │
-│  │ - Data Sources   │  │ - Data Sources   │  │ - Data Sources   │   │
+│  │ - Event Filter   │  │ - Event Filter   │  │ - Event Filter   │   │
+│  │ - Name Mapping   │  │ - Name Mapping   │  │ - Name Mapping   │   │
 │  │ - Fair Value Calc│  │ - Fair Value Calc│  │ - Fair Value Calc│   │
 │  │ - Trade Params   │  │ - Trade Params   │  │ - Trade Params   │   │
 │  └────────┬─────────┘  └────────┬─────────┘  └────────┬─────────┘  │
@@ -49,10 +75,10 @@ The architecture is **market-plugin based**: a core engine handles Polymarket in
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────────┐  │
 │  │ Signal Engine │  │   Executor   │  │    Risk Manager          │  │
 │  │              │  │              │  │                          │  │
-│  │ Compare fair │  │ Place orders │  │ Position limits          │  │
+│  │ Compare fair │  │ Place orders │  │ Outcome/event limits     │  │
 │  │ value to mkt │  │ via CLOB API │  │ Portfolio exposure       │  │
 │  │ price, emit  │  │ Track fills  │  │ Cooldowns                │  │
-│  │ trade signal │  │ Handle fails │  │ Max loss per market/day  │  │
+│  │ trade signal │  │ Handle fails │  │ Balance & bankroll       │  │
 │  └──────────────┘  └──────────────┘  └──────────────────────────┘  │
 │                                                                     │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────────┐  │
@@ -67,11 +93,15 @@ The architecture is **market-plugin based**: a core engine handles Polymarket in
 
 ### Flow
 
-1. **Each market plugin** periodically fetches external data (sportsbook odds) and computes a fair value for each outcome
-2. **The signal engine** compares each fair value to the current Polymarket price (from WebSocket or API)
-3. When `|fair_value - market_price|` exceeds the edge threshold (fees + buffer), a **trade signal** is emitted
-4. **Risk manager** gates the signal: checks position limits, portfolio exposure, cooldowns, daily loss limits
-5. **Executor** places the order on Polymarket via the CLOB API and tracks its lifecycle
+1. **Each scraper runs as an independent async task** on its own interval (e.g., scraper A every 30s, scraper B every 5 minutes). Scrapers are fully decoupled from each other.
+2. **When any scraper completes**, its `ScrapedOdds` is immediately processed — no waiting, no coordination with other scrapers.
+3. **Each plugin** whose `event_key` appears in the scraper's results extracts its odds, maps names, and computes fair values
+4. **The signal engine** compares each fair value to the current Polymarket price (from WebSocket or API)
+5. When `|fair_value - market_price|` exceeds the edge threshold (fees + buffer), a **trade signal** is emitted
+6. **Risk manager** gates the signal: checks position limits, portfolio exposure, cooldowns, balance thresholds
+7. **Executor** places the order on Polymarket via the CLOB API and tracks its lifecycle
+
+Scrapers are completely independent — each runs on its own schedule, and the latency from any individual scraper completing to a trade being placed is **under 1 second**.
 
 ---
 
@@ -79,7 +109,7 @@ The architecture is **market-plugin based**: a core engine handles Polymarket in
 
 ```
 poly-bot/
-├── main.py                      # Entry point: starts core engine + all enabled plugins
+├── main.py                      # Entry point: starts core engine + all enabled plugins (supports --dry-run flag)
 ├── config.yaml                  # Global configuration (credentials, risk params, enabled markets)
 │
 ├── core/                        # Core engine (market-agnostic)
@@ -92,26 +122,27 @@ poly-bot/
 │   ├── position_tracker.py      # Track positions, average cost, P&L per market
 │   ├── state.py                 # Persist/load bot state to/from disk (JSON)
 │   ├── models.py                # Data classes: Signal, Position, Order, MarketInfo, etc.
+│   ├── notifier.py              # Telegram alert notifications
 │   └── utils.py                 # Shared helpers (logging setup, retry logic, etc.)
 │
-├── markets/                     # Market plugins (one subpackage per market)
+├── scrapers/                    # Odds scrapers (each can cover one or many events)
+│   ├── __init__.py
+│   ├── base.py                  # Abstract scraper interface (BaseScraper)
+│   ├── models.py                # ScrapedOdds, EventOdds, BookOdds data classes
+│   ├── odds_aggregator.py       # Example: scrapes an aggregator site covering NHL, NBA, etc.
+│
+├── markets/                     # Market plugins (one subpackage per event)
 │   ├── __init__.py
 │   ├── base.py                  # Abstract base class: MarketPlugin interface
-│   ├── nhl_stanley_cup/            # Example: first market to implement
+│   ├── nhl_stanley_cup/         # Example: first event to implement
 │   │   ├── __init__.py
-│   │   ├── plugin.py            # Implements MarketPlugin — ties everything together
-│   │   ├── data_sources.py      # Fetch sportsbook odds for this market
+│   │   ├── plugin.py            # Implements MarketPlugin — filters ScrapedOdds, maps names
 │   │   ├── fair_value.py        # Vig removal, aggregation, sharp-book weighting
-│   │   └── config.yaml          # Market-specific params (teams, token IDs, thresholds)
-│   └── _template/               # Copy this to create a new market plugin
-│       ├── __init__.py
-│       ├── plugin.py
-│       ├── data_sources.py
-│       ├── fair_value.py
-│       └── config.yaml
+│   │   └── config.yaml          # Event-specific params (outcome mappings, token IDs, thresholds)
 │
 ├── data/                        # Runtime data (gitignored)
 │   ├── state.json               # Persisted bot state (positions, cooldowns)
+│   ├── trades.csv               # CSV trade summary log
 │   └── logs/                    # Log files
 │
 ├── tests/                       # Test suite
@@ -120,7 +151,7 @@ poly-bot/
 │   ├── test_risk_manager.py     # Unit tests for risk gates
 │   └── test_executor.py         # Unit tests for order logic
 │
-├── .env                         # Secrets (PK, BROWSER_ADDRESS) — gitignored
+├── .env                         # Secrets (PK, BROWSER_ADDRESS, TELEGRAM_*) — gitignored
 ├── .env.example                 # Template for .env
 ├── requirements.txt             # Python dependencies
 └── README.md                    # Setup and usage instructions
@@ -135,20 +166,19 @@ poly-bot/
 The engine runs a single async event loop that:
 
 1. **Initializes** the Polymarket client (authenticates, derives API keys)
-2. **Loads enabled market plugins** from config
+2. **Loads enabled scrapers and market plugins** from config
 3. **Starts WebSocket connections** for real-time Polymarket prices
-4. **Runs a polling loop** (one iteration every 30–60 seconds):
-   - Calls each plugin's `fetch_data()` → gets latest sportsbook odds
-   - Calls each plugin's `compute_fair_values()` → gets fair probability per outcome
-   - Calls `signal_engine.evaluate()` → compares fair values to Polymarket prices
-   - For each trade signal, passes through `risk_manager.check()` → approve or reject
-   - Approved signals go to `executor.execute()` → places the order
-5. **Runs a background task** that periodically syncs positions from the API (every 60s) as a ground-truth check against local tracking
+4. **Launches each scraper as an independent async task**, each running on its own interval. When a scraper completes:
+  - Its `ScrapedOdds` is passed to relevant plugins → `extract_odds()` → `compute_fair_values()`
+  - Signal engine compares fair values to Polymarket prices
+  - Signals pass through `risk_manager.approve()` → approved signals go to `executor.execute()`
+5. **Runs a background task** that periodically syncs positions and USDC balance from the API (every 60s) as a ground-truth check against local tracking
 
 ```python
 # Pseudocode
 async def run():
     client = PolymarketClient(config)
+    scrapers = load_scrapers(config.enabled_scrapers)
     plugins = load_plugins(config.enabled_markets)
     risk_mgr = RiskManager(config.risk)
     executor = Executor(client)
@@ -156,40 +186,79 @@ async def run():
 
     # Start WebSocket for live Polymarket prices
     asyncio.create_task(client.connect_market_ws(all_token_ids(plugins)))
-    asyncio.create_task(client.connect_user_ws())  # track own fills
-
-    while True:
+    async def process_scraper_result(scraped_odds: ScrapedOdds):
+        """Called whenever a scraper completes — processes immediately."""
         for plugin in plugins:
-            external_data = await plugin.fetch_data()
-            fair_values = plugin.compute_fair_values(external_data)
+            if plugin.event_key not in scraped_odds.events:
+                continue  # this scraper doesn't cover this plugin's event
+
+            event_odds = plugin.extract_odds(scraped_odds)
+            fair_values = plugin.compute_fair_values(event_odds)
             polymarket_prices = client.get_prices(plugin.token_ids)
 
             signals = evaluate_signals(fair_values, polymarket_prices, plugin.config)
 
             for signal in signals:
                 if risk_mgr.approve(signal, position_tracker):
-                    await executor.execute(signal)
+                    if not config.dry_run:
+                        await executor.execute(signal)
+                    else:
+                        logger.info(f"[DRY RUN] Would execute: {signal}")
 
-        await asyncio.sleep(config.poll_interval)  # 30-60s
+    async def scraper_loop(scraper: BaseScraper):
+        """Each scraper runs independently on its own interval."""
+        while True:
+            try:
+                scraped_odds = await scraper.scrape()
+                await process_scraper_result(scraped_odds)
+            except Exception as e:
+                logger.error(f"Scraper {scraper.get_name()} failed: {e}")
+            await asyncio.sleep(scraper.interval)
+
+    # Start each scraper as an independent async task
+    for scraper in scrapers:
+        asyncio.create_task(scraper_loop(scraper))
+```
+
+### 3.1.1 Dry-Run Mode
+
+The bot supports a `--dry-run` flag that runs the full pipeline (fetch odds, compute fair values, generate signals, check risk gates) but **stops before placing any orders**. In dry-run mode:
+
+- All signals are logged with full detail (edge, Kelly size, fair value, market price)
+- Risk manager approvals/rejections are logged
+- No orders are placed — the executor logs what *would* have been executed
+- Position tracker is not updated (no phantom positions)
+- CSV trade log is still written (for offline analysis of signal quality)
+
+This is essential for validating the model and tuning thresholds before risking real money.
+
+```python
+# In engine.py
+if not config.dry_run:
+    await executor.execute(signal)
+else:
+    logger.info(f"[DRY RUN] Would execute: {signal}")
 ```
 
 ### 3.2 `polymarket_client.py` — API & WebSocket Client
 
 **Keep from market-maker bot:**
+
 - Authentication flow (PK + BROWSER_ADDRESS → ClobClient with signature_type=2)
 - API key derivation
-- WebSocket connection management (Market WS + User WS) with auto-reconnect
+- WebSocket connection management (Market WS) with auto-reconnect
 - On-chain contract approvals (`approveContracts()`)
-- Position merging (YES + NO → USDC recovery)
 - Position/balance queries
 
 **Adapt:**
+
 - Order placement: the market-maker always posts limit orders at computed prices. For market-taking, we need to support:
   - **FOK (Fill-or-Kill)**: attempt to fill entire order immediately or cancel — best for larger orders where partial fills aren't useful
   - **FAK (Fill-and-Kill)**: fill what's available immediately, cancel the rest — good for grabbing available liquidity
   - **GTC with aggressive price**: post a limit order at/above the best ask (to buy) or at/below the best bid (to sell) — functionally a market order that fills immediately if liquidity exists
 
 **Key methods:**
+
 ```python
 class PolymarketClient:
     def __init__(self, pk, browser_address, ...):
@@ -197,9 +266,6 @@ class PolymarketClient:
 
     async def connect_market_ws(self, token_ids: list[str]):
         # Subscribe to order book updates for monitored tokens
-
-    async def connect_user_ws(self):
-        # Authenticated — receive fill/order events for own account
 
     def get_prices(self, token_ids: list[str]) -> dict[str, PriceInfo]:
         # Return best bid, best ask, midpoint from local order book cache
@@ -213,11 +279,12 @@ class PolymarketClient:
     async def cancel_order(self, order_id: str) -> bool:
         # Cancel an open order
 
+    def get_usdc_balance(self) -> float:
+        # Query USDC ERC-20 balanceOf(wallet) on Polygon via web3
+        # Returns balance in USD (raw / 1e6)
+
     def get_positions(self) -> dict[str, Position]:
         # Fetch current positions from data API
-
-    async def merge_positions(self, condition_id, amount, neg_risk) -> bool:
-        # Merge YES+NO tokens back to USDC (via Node.js subprocess)
 ```
 
 ### 3.3 `executor.py` — Order Execution
@@ -275,13 +342,12 @@ class OutcomeFairValue:
     outcome_name: str       # e.g., "Toronto Maple Leafs"
     token_id: str           # Polymarket token ID for YES on this outcome
     fair_value: float       # Computed fair probability (0.0 - 1.0)
-    confidence: float       # 0.0 - 1.0, how confident we are in this estimate
     sources_agreeing: int   # How many sportsbooks contributed to this estimate
 
 class MarketPlugin(ABC):
     """
     Each market implements this interface.
-    The core engine calls these methods in order during each polling cycle.
+    The core engine calls these methods whenever a scraper delivers new data.
     """
 
     @abstractmethod
@@ -293,40 +359,38 @@ class MarketPlugin(ABC):
         """All Polymarket token IDs this plugin monitors"""
 
     @abstractmethod
-    def get_condition_ids(self) -> list[str]:
-        """Condition IDs for position merging"""
-
-    @abstractmethod
-    async def fetch_data(self) -> dict:
+    def extract_odds(self, scraped_odds: ScrapedOdds) -> dict:
         """
-        Fetch external data (sportsbook odds, etc.).
-        Returns raw data dict — structure is plugin-defined.
+        Filter the full ScrapedOdds to this plugin's event and map outcome names
+        using the sportsbook_keys config. Returns the standardized internal format:
+        { outcome_name: [(sportsbook, decimal_odds), ...] }
         """
 
     @abstractmethod
-    def compute_fair_values(self, raw_data: dict) -> list[OutcomeFairValue]:
+    def compute_fair_values(self, mapped_odds: dict) -> list[OutcomeFairValue]:
         """
-        Transform raw external data into fair value probabilities.
+        Transform mapped odds into fair value probabilities.
         Includes vig removal, aggregation, and weighting.
         """
 
     @abstractmethod
     def get_trade_params(self) -> TradeParams:
         """
-        Return market-specific trading parameters:
-        - edge_threshold: minimum edge required to trade (e.g., 0.05)
-        - max_position_size: max USDC exposure per outcome
+        Return event-specific trading parameters:
+        - edge_threshold: minimum relative edge required to trade (e.g., 0.10 = 10%)
+        - max_outcome_exposure: max USDC exposure per outcome
         - kelly_fraction: fraction of full Kelly to use (e.g., 0.25 for quarter-Kelly)
         - order_type: FOK or FAK
         - min_sources: minimum sportsbooks required to generate a signal
-        - neg_risk: whether this is a neg-risk market
+        - neg_risk: whether this is a neg-risk event
         - tick_size: minimum price increment
         """
 ```
 
 ### 4.2 Example Plugin: `markets/nhl_stanley_cup/`
 
-**`config.yaml`**
+`**config.yaml**`
+
 ```yaml
 name: "2026 NHL Stanley Cup Champion"
 polymarket:
@@ -351,61 +415,92 @@ outcomes:
   # ... all teams
 
 trade_params:
-  edge_threshold: 0.05        # 5% edge required to trade
-  max_position_size: 100      # max $100 per outcome
+  edge_threshold: 0.10        # 10% relative edge required (e.g., fair value 20% → buy at 18c or better)
+  max_outcome_exposure: 200   # max $200 per outcome
   kelly_fraction: 0.25        # use quarter-Kelly (conservative)
   min_bet_size: 5             # minimum bet in USDC (skip if Kelly suggests less)
   max_bet_size: 50            # cap per-trade size regardless of Kelly
   order_type: "FOK"
   min_sources: 3              # need at least 3 books agreeing
-  min_confidence: 0.7         # minimum confidence score
   cooldown_minutes: 30        # wait 30 min after a trade before re-evaluating same outcome
   price_range: [0.03, 0.95]   # only trade in this price range
 
-data_sources:
-  poll_interval: 60           # fetch sportsbook odds every 60 seconds
-  sportsbooks:
-    - betano
-    - bet365
-    - draftkings
-    - fanduel
-    - betmgm
-    - caesars
+scraper:
+  event_key: "2026 NHL Stanley Cup Champion"  # must match key in ScrapedOdds.events
 ```
 
-**`data_sources.py`**
+The plugin no longer has a `data_sources.py` — odds come from the shared scraper. The plugin's `extract_odds()` method uses the `outcomes` name mappings and `scraper.event_key` to pull its slice of the `ScrapedOdds` data.
+
+> **Sportsbook data acquisition:** Custom scrapers fetch odds from sportsbooks. Each scraper can cover one or many events (e.g., one scraper might cover all NHL and NBA events from an aggregator site, while another covers soccer from a different source). All enabled scrapers run in parallel once per cycle, and their outputs are merged into a single `ScrapedOdds` shared across all plugins.
+
+**Scraper output format:** The scraper returns a single `ScrapedOdds` object containing all events and all sportsbooks:
+
 ```python
-class NHLAtlanticDataSource:
-    """
-    Fetches odds for 2026 NHL Stanley Cup Champion from multiple sportsbooks.
+@dataclass
+class BookOdds:
+    sportsbook: str              # e.g., "bet365"
+    decimal_odds: float          # e.g., 4.50
 
-    Input: sportsbook websites/APIs
-    Output: dict mapping team_name -> list of (sportsbook, decimal_odds)
+@dataclass
+class EventOdds:
+    event_name: str              # e.g., "2026 NHL Stanley Cup Champion"
+    outcomes: dict[str, list[BookOdds]]  # outcome_name → list of odds from different books
 
-    Format:
-    {
-        "Toronto Maple Leafs": [
-            ("betano", 3.50),
-            ("bet365", 3.40),
-            ("draftkings", 3.45),
-            ("fanduel", 3.55),
-            ...
-        ],
-        "Florida Panthers": [...],
-        ...
-    }
-    """
+@dataclass
+class ScrapedOdds:
+    timestamp: datetime
+    events: dict[str, EventOdds]  # event_name → EventOdds
 
-    async def fetch(self) -> dict:
-        # Fetch from each configured sportsbook in parallel
-        # Each sportsbook fetcher returns odds for all teams
-        # Merge results by team name using the sportsbook_keys mapping
-        pass
+# Example output from one scrape run:
+# ScrapedOdds(
+#     timestamp=datetime(2026, 3, 19, 14, 29, 50),
+#     events={
+#         "2026 NHL Stanley Cup Champion": EventOdds(
+#             event_name="2026 NHL Stanley Cup Champion",
+#             outcomes={
+#                 "Toronto Maple Leafs": [
+#                     BookOdds("bet365", 4.50),
+#                     BookOdds("draftkings", 4.45),
+#                     BookOdds("fanduel", 4.55),
+#                 ],
+#                 "Florida Panthers": [
+#                     BookOdds("bet365", 3.00),
+#                     BookOdds("draftkings", 3.10),
+#                     ...
+#                 ],
+#             }
+#         ),
+#         "2026 NHL Atlantic Division": EventOdds(...),
+#         "2026 NBA Champion": EventOdds(...),
+#     }
+# )
 ```
 
-> **Note on sportsbook data acquisition:** The data source is TBD — either an existing sportsbook scraper or a third-party service like The Odds API. The plugin interface is designed to be agnostic: regardless of how odds are fetched, the `data_sources.py` module must return a standardized dict of `team → [(sportsbook, decimal_odds), ...]`. This means swapping from scraper to API (or vice versa) only requires changing the internals of `data_sources.py`, not any other part of the system.
+Each plugin's `extract_odds()` method pulls its event from `ScrapedOdds.events` using the `scraper.event_key` from its config, then maps outcome names using `sportsbook_keys`. This means:
 
-**`fair_value.py`**
+- **Adding a new event** only requires a new plugin config — no scraper changes needed if the event is already scraped by an existing scraper
+- **Adding a new sport/source** only requires a new scraper — its output gets merged automatically
+- **Scrapers are fully decoupled** from plugins — build and test them independently
+
+**Scraper base class:**
+
+```python
+class BaseScraper(ABC):
+    interval: int  # seconds between scrape runs (configured per scraper)
+
+    @abstractmethod
+    async def scrape(self) -> ScrapedOdds:
+        """Run the scraper. Returns ScrapedOdds with all events this scraper covers."""
+
+    @abstractmethod
+    def get_name(self) -> str:
+        """Identifier for this scraper, e.g. 'odds_aggregator'"""
+```
+
+Each scraper's output is processed independently on arrival — no merging step. If two scrapers happen to cover the same event, each triggers its own evaluation cycle for that event's plugins (the later one simply re-evaluates with fresher data).
+
+`**fair_value.py**`
+
 ```python
 class NHLAtlanticFairValue:
     """
@@ -415,15 +510,10 @@ class NHLAtlanticFairValue:
     1. Convert decimal odds to implied probabilities: prob = 1 / odds
     2. Remove vig from each sportsbook's odds (all outcomes sum to >100%)
        Method: proportional reduction — divide each prob by the overround
-    3. Aggregate across sportsbooks:
-       - Option A: Simple average of devigged probabilities
-       - Option B: Sharp-book weighted average (Bet365/Pinnacle get higher weight)
-       - Option C: Median (robust to outlier books)
-       Start with Option B.
-    4. Compute confidence score based on:
-       - Number of contributing sportsbooks
-       - Agreement between books (low variance = high confidence)
-       - Staleness (if a book's line hasn't moved in hours, lower its weight)
+    3. Aggregate across sportsbooks using a weighted average where each book
+       has a configurable weight (e.g., sharp books like Bet365/Pinnacle get
+       higher weight than softer books). Weights are defined in the plugin's
+       config.yaml.
     """
 
     def compute(self, raw_odds: dict) -> list[OutcomeFairValue]:
@@ -431,24 +521,28 @@ class NHLAtlanticFairValue:
 ```
 
 **Vig removal example:**
+
 ```
 Sportsbook has: Leafs +350 (4.50), Panthers +200 (3.00), Bruins +500 (6.00), ...
 Implied probs:  22.2%,              33.3%,              16.7%, ... = sum 115% (15% vig)
 Devigged:       19.3%,              29.0%,              14.5%, ... = sum 100%
 ```
 
-### 4.3 Adding a New Market
+### 4.3 Adding a New Event
 
-To add a new market (e.g., "NHL Atlantic Division Winner"):
+To add a new event (e.g., "NHL Atlantic Division Winner"):
 
-1. Copy `markets/_template/` to `markets/nhl_atlantic/`
-2. Fill in `config.yaml` with the Polymarket event slug, outcome-to-sportsbook mappings, and trade parameters
-3. Implement `data_sources.py` — this can often reuse an existing sportsbook fetcher if the data source is the same (just different market within the same sport)
-4. Implement `fair_value.py` — may be identical to another market's if the vig removal logic is the same
-5. Add the market to `config.yaml`'s `enabled_markets` list
-6. Restart the bot
+1. Create a new directory `markets/nhl_atlantic/` (use an existing plugin like `nhl_stanley_cup/` as a reference)
+2. Fill in `config.yaml` with:
+  - Polymarket event slug
+  - `scraper.event_key` matching the key the scraper uses for this event
+  - Outcome name mappings (sportsbook names → canonical names)
+  - Trade parameters
+3. Implement `fair_value.py` — may be identical to another event's if the vig removal logic is the same
+4. Add the event to `config.yaml`'s `enabled_markets` list
+5. Restart the bot
 
-For markets with **different types of data sources** (not sportsbooks — e.g., weather data for a weather market, polling data for an election market), the same plugin interface works. The `data_sources.py` fetches from whatever source is relevant, and `fair_value.py` converts it to a probability.
+No scraper changes needed if the event is already being scraped. No `data_sources.py` needed — the plugin just filters from the shared `ScrapedOdds`.
 
 ---
 
@@ -457,36 +551,42 @@ For markets with **different types of data sources** (not sportsbooks — e.g., 
 ### 5.1 External Data (Sportsbook Odds)
 
 **Fetch cycle:**
+
 ```
-Every poll_interval seconds (per plugin):
-  1. For each configured sportsbook (in parallel):
-     - HTTP request to fetch odds page/API
-     - Parse response → extract decimal odds per outcome
-     - Handle errors: timeout, parsing failure, rate limit
-  2. Merge results into standardized format:
-     { outcome_name: [(sportsbook, decimal_odds), ...] }
-  3. Pass to fair_value.compute()
+Each scraper runs as an independent async loop:
+  Every scraper.interval seconds:
+    1. Scraper fetches odds for the events it covers
+    2. Returns ScrapedOdds → immediately passed to relevant plugins
+    3. Plugins filter to their event, map names, compute fair values
+    4. Signals evaluated and trades executed — all within milliseconds
+    5. Errors caught per-scraper (one failing doesn't affect others)
+    6. Sleep for scraper.interval, then repeat
 ```
+
+Scrapers are fully independent — each has its own interval and lifecycle. A fast-changing data source can poll every 30s while a slow one polls every 5 minutes.
 
 **Data format standardization:**
-- All odds converted to **decimal format** (European odds) internally
-- American odds (+350, -150) converted: positive = (odds/100) + 1, negative = (100/|odds|) + 1
-- Fractional odds (7/2) converted: (num/denom) + 1
+
+- All odds stored as **decimal format** (European odds) in the ScrapedOdds output
+- The scraper is responsible for converting from whatever format the source uses:
+  - American odds (+350, -150): positive = (odds/100) + 1, negative = (100/|odds|) + 1
+  - Fractional odds (7/2): (num/denom) + 1
 
 **Staleness handling:**
-- Track `last_updated` timestamp per sportsbook per market
-- If a sportsbook hasn't returned new data in > 10 minutes, flag it as stale
-- Stale sources get reduced weight (or excluded if > 30 min stale)
+
+- `ScrapedOdds.timestamp` tracks when the scrape ran
+- If the scraper fails or returns no data for an event, plugins skip that cycle
+- Individual sportsbook staleness is harder to detect with a single scraper — if the source doesn't update a book's odds, the scraper returns the same values. Consider logging when odds haven't changed across multiple cycles.
 
 ### 5.2 Polymarket Data
 
 **Two sources, used together:**
 
 1. **WebSocket (real-time):** Market WS provides live order book updates. The bot maintains a local order book cache (same `SortedDict` approach as the market-maker bot). This gives instant access to current best bid, best ask, and available liquidity at each price level.
-
 2. **Gamma API (on-demand):** Used at startup to discover token IDs from event slugs, and periodically to cross-check prices. The `bestBid`/`bestAsk` fields from Gamma are the correct effective prices for neg-risk markets.
 
 **Price used for signal generation:**
+
 - For neg-risk markets (multi-outcome like division winners): use **Gamma API** `bestBid`/`bestAsk` as the primary price source. The CLOB raw orderbook for neg-risk markets shows misleading prices (~0.001 bids / ~0.999 asks) that don't reflect the effective market.
 - For standard binary markets: use the **WebSocket-maintained local order book** for best bid/ask.
 - In both cases, verify with the **CLOB order book** when executing to confirm liquidity exists at the target price.
@@ -494,34 +594,42 @@ Every poll_interval seconds (per plugin):
 ### 5.3 Data Flow Diagram
 
 ```
-Sportsbook A ──┐
-Sportsbook B ──┤  (parallel HTTP fetches, every 30-60s)
-Sportsbook C ──┤
-Sportsbook D ──┼──► data_sources.fetch() ──► raw_odds dict
-Sportsbook E ──┤
-Sportsbook F ──┘
-                                                │
-                                                ▼
-                                    fair_value.compute()
-                                                │
-                                                ▼
-                                    OutcomeFairValue per team
-                                    (fair prob + confidence)
-                                                │
-                        ┌───────────────────────┤
-                        ▼                       ▼
-              Polymarket Price            Compare: edge?
-              (from WS or Gamma)                │
-                        │                       ▼
-                        └──────────► Signal (BUY YES @ team X)
-                                                │
-                                                ▼
-                                        Risk Manager
-                                          (approve?)
-                                                │
-                                                ▼
-                                           Executor
-                                        (place FOK order)
+          ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+          │  Scraper A   │  │  Scraper B   │  │  Scraper C   │
+          │ (NHL, NBA)   │  │  (soccer)    │  │  (NFL)       │
+          │ every 60s    │  │ every 300s   │  │ every 120s   │
+          └──────┬───────┘  └──────┬───────┘  └──────┬───────┘
+                 │                 │                  │
+          independent loops — each triggers pipeline on completion
+                 │                 │                  │
+                    ┌──────────────┼──────────────┐
+                    ▼              ▼              ▼
+             Plugin A        Plugin B        Plugin C
+          extract_odds()   extract_odds()   extract_odds()
+          (filter event,   (filter event,   (filter event,
+           map names)       map names)       map names)
+                    │              │              │
+                    ▼              ▼              ▼
+             fair_value       fair_value      fair_value
+             .compute()       .compute()      .compute()
+                    │              │              │
+                    ▼              ▼              ▼
+             OutcomeFairValues (fair prob per outcome)
+                    │
+                    │         Polymarket Price
+                    │         (from WS or Gamma)
+                    │              │
+                    ▼              ▼
+                  Compare: edge > threshold?
+                           │
+                           ▼
+                    Signal (BUY YES @ team X)
+                           │
+                           ▼
+                     Risk Manager (approve?)
+                           │
+                           ▼
+                      Executor (place FOK order)
 ```
 
 ---
@@ -536,70 +644,73 @@ def evaluate_signals(fair_values, polymarket_prices, trade_params) -> list[Signa
     for fv in fair_values:
         pm_price = polymarket_prices[fv.token_id]  # PriceInfo with best_bid, best_ask
 
-        # Edge calculation: fair value vs what we'd pay/receive
-        # To BUY: we pay the best ask. Edge = fair_value - best_ask
-        buy_edge = fv.fair_value - pm_price.best_ask
-        # To SELL: we receive the best bid. Edge = best_bid - fair_value
-        sell_edge = pm_price.best_bid - fv.fair_value
+        # Edge calculation: relative difference between fair value and market price
+        # To BUY: we pay the best ask. Relative edge = (fair_value - best_ask) / fair_value
+        buy_edge = (fv.fair_value - pm_price.best_ask) / fv.fair_value if fv.fair_value > 0 else 0
+        # To SELL: we receive the best bid. Relative edge = (best_bid - fair_value) / fair_value
+        sell_edge = (pm_price.best_bid - fv.fair_value) / fv.fair_value if fv.fair_value > 0 else 0
 
         if buy_edge > trade_params.edge_threshold:
-            if fv.confidence >= trade_params.min_confidence:
-                if fv.sources_agreeing >= trade_params.min_sources:
-                    bet_size = kelly_bet_size(
-                        fair_prob=fv.fair_value,
+            if fv.sources_agreeing >= trade_params.min_sources:
+                bet_size = kelly_bet_size(
+                    fair_prob=fv.fair_value,
+                    market_price=pm_price.best_ask,
+                    bankroll=trade_params.kelly_bankroll,
+                    kelly_fraction=trade_params.kelly_fraction,
+                    min_bet=trade_params.min_bet_size,
+                    max_bet=trade_params.max_bet_size,
+                )
+                if bet_size > 0:
+                    signals.append(Signal(
+                        token_id=fv.token_id,
+                        side="BUY",
+                        edge=buy_edge,
+                        fair_value=fv.fair_value,
                         market_price=pm_price.best_ask,
-                        bankroll=trade_params.current_bankroll,
-                        kelly_fraction=trade_params.kelly_fraction,
-                        min_bet=trade_params.min_bet_size,
-                        max_bet=trade_params.max_bet_size,
-                    )
-                    if bet_size > 0:
-                        signals.append(Signal(
-                            token_id=fv.token_id,
-                            side="BUY",
-                            edge=buy_edge,
-                            fair_value=fv.fair_value,
-                            market_price=pm_price.best_ask,
-                            max_price=pm_price.best_ask,
-                            size=bet_size,  # Kelly-computed USDC amount
-                            confidence=fv.confidence,
-                        ))
+                        max_price=pm_price.best_ask,
+                        size=bet_size,  # Kelly-computed USDC amount
+                    ))
 
         elif sell_edge > trade_params.edge_threshold:
             # Only sell if we hold a position in this token
-            if fv.confidence >= trade_params.min_confidence:
-                if fv.sources_agreeing >= trade_params.min_sources:
-                    signals.append(Signal(
-                        token_id=fv.token_id,
-                        side="SELL",
-                        edge=sell_edge,
-                        fair_value=fv.fair_value,
-                        market_price=pm_price.best_bid,
-                        min_price=pm_price.best_bid,
-                        size=None,  # sell entire position (or available liquidity)
-                        confidence=fv.confidence,
-                    ))
+            if fv.sources_agreeing >= trade_params.min_sources:
+                signals.append(Signal(
+                    token_id=fv.token_id,
+                    side="SELL",
+                    edge=sell_edge,
+                    fair_value=fv.fair_value,
+                    market_price=pm_price.best_bid,
+                    min_price=pm_price.best_bid,
+                    size=None,  # sell entire position (or available liquidity)
+                ))
 
     return signals
 ```
 
 ### 6.2 Edge Threshold Considerations
 
-The edge threshold must cover:
+The edge threshold is a **relative** percentage — the market price must be at least this percentage below (for buys) or above (for sells) the fair value.
+
+The threshold must cover:
+
 1. **Taker fees** (if applicable): up to 0.44% for sports markets at 50% price, less at extremes
-2. **Slippage**: the price may move slightly between signal and execution
-3. **Model uncertainty**: our fair value estimate isn't perfect
-4. **Safety buffer**: additional margin for profitability
+2. **Model uncertainty**: our fair value estimate isn't perfect
+3. **Safety buffer**: additional margin for profitability
 
-Starting recommendation: **5% edge threshold** (0.05 in probability terms). This is conservative — can be tightened as the model proves accurate.
+Starting recommendation: **10% relative edge threshold** (0.10). This is conservative — can be tightened as the model proves accurate.
 
-Example: if our fair value for the Leafs is 25% and Polymarket asks 19 cents, edge = 0.06 (6%) > 0.05 threshold → BUY signal.
+Example: if our fair value for the Leafs is 20%, the threshold requires the market price to be at least 10% lower → buy at 18 cents or better. `(0.20 - 0.18) / 0.20 = 0.10` → meets threshold → BUY signal.
+
+Another example: fair value 50% → buy at 45 cents or better. `(0.50 - 0.45) / 0.50 = 0.10` → meets threshold.
+
+Note: relative edge means the absolute price gap required scales with the fair value. A 10% relative edge on a 5-cent outcome is only 0.5 cents, while on a 50-cent outcome it's 5 cents. This naturally adapts to the price level.
 
 ### 6.3 Bet Sizing: Kelly Criterion
 
 Position sizes are computed using the **Kelly criterion**, which maximizes long-term bankroll growth by sizing bets proportionally to edge and probability.
 
 **Full Kelly formula for a binary bet:**
+
 ```
 Kelly % = (p * b - q) / b
 
@@ -621,7 +732,7 @@ def kelly_bet_size(fair_prob, market_price, bankroll, kelly_fraction=0.25,
     Args:
         fair_prob: our estimated true probability (0-1)
         market_price: price we'd pay per share on Polymarket (0-1)
-        bankroll: current available bankroll in USDC
+        bankroll: fixed bankroll set in config (for Kelly sizing)
         kelly_fraction: fraction of full Kelly to use (0.25 = quarter-Kelly)
         min_bet: minimum bet size in USDC (skip if Kelly suggests less)
         max_bet: maximum bet size in USDC per trade
@@ -632,7 +743,7 @@ def kelly_bet_size(fair_prob, market_price, bankroll, kelly_fraction=0.25,
     if market_price <= 0 or market_price >= 1:
         return 0
 
-    b = (1 / market_price) - 1  # net odds
+    b = (1 / market_price) - 1  # net odds (fees ignored for now — revisit if edge is tight)
     q = 1 - fair_prob
 
     kelly_pct = (fair_prob * b - q) / b  # full Kelly fraction of bankroll
@@ -648,37 +759,35 @@ def kelly_bet_size(fair_prob, market_price, bankroll, kelly_fraction=0.25,
 ```
 
 **Example:**
-```
-Fair value: 0.25 (25% chance)
-Market ask: 0.19 ($0.19 per share)
-Bankroll:   $1000
-Net odds:   1/0.19 - 1 = 4.26
 
-Full Kelly: (0.25 * 4.26 - 0.75) / 4.26 = 0.074 (7.4% of bankroll = $74)
-Quarter-Kelly: $74 * 0.25 = $18.50
-→ Bet $18.50 on this outcome
+```
+Fair value: 0.20 (20% chance)
+Market ask: 0.18 ($0.18 per share)
+Relative edge: (0.20 - 0.18) / 0.20 = 0.10 (10%) → meets threshold
+Bankroll:   $1000
+Net odds:   1/0.18 - 1 = 4.56
+
+Full Kelly: (0.20 * 4.56 - 0.80) / 4.56 = 0.024 (2.4% of bankroll = $24)
+Quarter-Kelly: $24 * 0.25 = $6.00
+→ Bet $6.00 on this outcome
 ```
 
 **Why fractional Kelly:**
+
 - Full Kelly assumes our fair value estimates are perfectly calibrated — they won't be, especially early on
 - Quarter-Kelly provides ~75% of the long-term growth rate of full Kelly but with far less variance
 - Can increase the fraction (to half-Kelly, etc.) as the model proves accurate over time
 
-**Bankroll definition:** `current_bankroll` = total USDC balance + mark-to-market value of all positions. Updated each polling cycle.
+**Bankroll definition:** `kelly_bankroll` is a fixed value set in config (e.g., $1000). Unlike a dynamic bankroll that fluctuates with balance and positions, this is a manually configured number that determines bet sizing. Adjust it up or down as you see fit based on your overall risk appetite — Kelly will scale bets proportionally.
 
 ### 6.4 Sell Strategy: Edge Disappearance
 
-The primary exit strategy is to **sell when the edge disappears** — i.e., when the Polymarket price converges to (or exceeds) our fair value estimate, meaning the mispricing we bet on has corrected.
+The exit strategy is simple: **sell when we can get a favorable price** (at or above fair value). Otherwise, hold to resolution.
 
-**Sell conditions (checked every polling cycle for all open positions):**
+**Sell condition (checked whenever a scraper delivers new data, for all open positions):**
 
-1. **Edge gone + liquidity available:** `polymarket_best_bid >= fair_value` AND sufficient liquidity at the bid → SELL entire position at market (FOK at best bid). The mispricing has corrected; take the profit.
-
-2. **Edge reversed:** `fair_value < avg_cost` (our model now says the outcome is less likely than what we paid) → this is a model-driven exit, regardless of whether the Polymarket price is favorable. Sell at market if liquidity allows.
-
-3. **Stop-loss:** P&L exceeds loss threshold → forced exit (see Risk Management section).
-
-4. **Hold otherwise:** If the edge still exists (fair value > market price) or if there's no liquidity at a reasonable price, continue holding. The position pays $1 if the outcome occurs, so holding to resolution is the fallback.
+- **Fair price available:** `polymarket_best_bid >= fair_value` AND sufficient liquidity at the bid → SELL entire position (FOK at best bid). The mispricing has corrected; take the profit.
+- **Hold otherwise:** If the market bid is below fair value, continue holding. The position pays $1 if the outcome occurs, so holding to resolution is always an option. We entered the trade for a reason — no stop-loss, no panic selling.
 
 ```python
 def check_exits(positions, fair_values, polymarket_prices, trade_params):
@@ -690,24 +799,14 @@ def check_exits(positions, fair_values, polymarket_prices, trade_params):
         if not fv or not pm:
             continue
 
-        # Condition 1: Edge disappeared — fair value ≤ market bid (we can sell at or above fair value)
+        # Can we sell at or above fair value?
         if pm.best_bid >= fv.fair_value and pm.bid_liquidity >= pos.size:
             exit_signals.append(Signal(
                 token_id=pos.token_id, side="SELL", edge=0,
                 fair_value=fv.fair_value, market_price=pm.best_bid,
                 min_price=fv.fair_value,  # don't sell below fair value
                 size=None,  # sell entire position
-                confidence=fv.confidence, reason="edge_disappeared"
-            ))
-
-        # Condition 2: Edge reversed — model says we're wrong
-        elif fv.fair_value < pos.avg_cost * 0.90:  # fair value dropped >10% below entry
-            exit_signals.append(Signal(
-                token_id=pos.token_id, side="SELL", edge=0,
-                fair_value=fv.fair_value, market_price=pm.best_bid,
-                min_price=0,  # willing to sell at any price (cut losses)
-                size=None,
-                confidence=fv.confidence, reason="edge_reversed"
+                reason="edge_disappeared"
             ))
 
     return exit_signals
@@ -716,7 +815,7 @@ def check_exits(positions, fair_values, polymarket_prices, trade_params):
 ### 6.5 When NOT to Trade
 
 Even with sufficient edge, skip if:
-- Confidence score is too low (< `min_confidence`)
+
 - Too few sportsbooks have data (< `min_sources`)
 - Price is outside the configured `price_range` (avoid extremes near 0 or 1)
 - Available liquidity at the target price is too thin (< Kelly bet size)
@@ -729,32 +828,34 @@ Even with sufficient edge, skip if:
 
 ### 7.1 Order Types for Market-Taking
 
-| Order Type | When to Use | Behavior |
-|---|---|---|
-| **FOK** (Fill-or-Kill) | Default for clean execution | Entire order fills at target price or is cancelled. No partial fills, no stale orders. |
-| **FAK** (Fill-and-Kill) | When partial fills are OK | Fills whatever is available at target price, cancels the rest. Use when liquidity is thin but any fill is better than none. |
+
+| Order Type              | When to Use                 | Behavior                                                                                                                    |
+| ----------------------- | --------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| **FOK** (Fill-or-Kill)  | Default for clean execution | Entire order fills at target price or is cancelled. No partial fills, no stale orders.                                      |
+| **FAK** (Fill-and-Kill) | When partial fills are OK   | Fills whatever is available at target price, cancels the rest. Use when liquidity is thin but any fill is better than none. |
+
 
 **Never use GTC** for taking signals. A GTC order that doesn't immediately fill becomes a passive limit order sitting on the book — this turns us into a market maker, which is not the intent and creates adverse selection risk.
 
 ### 7.2 Execution Flow
 
 ```
-Signal received (BUY YES token for team X at price ≤ 0.19, Kelly size = $18.50)
+Signal received (BUY YES token for team X at price ≤ 0.18, Kelly size = $6.00)
   │
-  ├── 1. Check order book liquidity at 0.19 or better
+  ├── 1. Check order book liquidity at 0.18 or better
   │      Walk asks from best ask upward, accumulate size
-  │      Available: 200 shares at ≤ 0.19
+  │      Available: 200 shares at ≤ 0.18
   │
-  ├── 2. Size the order: Kelly says $18.50 → 18.50 / 0.19 = ~97 shares
-  │      200 available at price → can fill 97 shares.
+  ├── 2. Size the order: Kelly says $6.00 → 6.00 / 0.18 = ~33 shares
+  │      200 available at price → can fill 33 shares.
   │
   ├── 3. Place FOK order:
-  │      token_id=X, side=BUY, size=97, price=0.19
+  │      token_id=X, side=BUY, size=33, price=0.18
   │
   ├── 4a. If filled:
-  │       - Save market snapshot (all sportsbook odds at time of trade)
-  │       - Update position tracker: +97 shares @ avg 0.19
-  │       - Log: "BUY 97 shares of Leafs YES @ 0.19 (edge: 6%, Kelly: $18.50)"
+  │       - Append row to CSV trade log
+  │       - Update position tracker: +33 shares @ avg 0.18
+  │       - Log: "BUY 33 shares of Leafs YES @ 0.18 (edge: 10%, Kelly: $6.00)"
   │       - Start cooldown timer for this outcome
   │
   └── 4b. If rejected (no fill):
@@ -765,6 +866,7 @@ Signal received (BUY YES token for team X at price ≤ 0.19, Kelly size = $18.50
 ### 7.3 Neg-Risk Market Execution
 
 For neg-risk multi-outcome markets (like division winners), there's a nuance:
+
 - Each outcome's YES token trades on its own CLOB order book
 - The CLOB raw prices may not match Gamma effective prices
 - **Use Gamma API bestAsk** to determine if the edge exists
@@ -772,6 +874,7 @@ For neg-risk multi-outcome markets (like division winners), there's a nuance:
 - The CLOB ask side (reversed) shows effective ask prices that match Gamma
 
 When executing a buy on a neg-risk market:
+
 1. Verify the edge using Gamma bestAsk
 2. Walk CLOB asks (reversed) to find liquidity at that price level
 3. Place the order at the CLOB ask price level where liquidity exists
@@ -782,26 +885,27 @@ When executing a buy on a neg-risk market:
 
 ### 8.1 Position Limits
 
-| Limit | Scope | Default | Purpose |
-|---|---|---|---|
-| `max_position_size` | Per outcome | $100 | Cap exposure to any single team/outcome |
-| `max_market_exposure` | Per market (all outcomes combined) | $300 | Cap total exposure in one event |
-| `max_portfolio_exposure` | All markets | $1000 | Cap total bot exposure |
-| `max_daily_loss` | Per day | $50 | Stop trading if daily P&L hits this |
+
+| Limit                    | Scope                             | Default | Purpose                                                       |
+| ------------------------ | --------------------------------- | ------- | ------------------------------------------------------------- |
+| `max_outcome_exposure`   | Per outcome                       | $200    | Cap exposure to any single outcome (e.g., one team)           |
+| `max_event_exposure`     | Per event (all outcomes combined) | $500    | Cap total exposure in one event (e.g., all Stanley Cup teams) |
+| `max_portfolio_exposure` | All events                        | $1000   | Cap total bot exposure                                        |
+
 
 ### 8.2 Risk Gates (checked before every trade)
 
 ```python
 class RiskManager:
     def approve(self, signal: Signal, tracker: PositionTracker) -> bool:
-        # 1. Position limit: would this trade exceed max_position_size?
+        # 1. Outcome limit: would this trade exceed max_outcome_exposure?
         current = tracker.get_position(signal.token_id)
-        if current.size_usd + signal.size > self.max_position_size:
+        if current.size_usd + signal.size > self.max_outcome_exposure:
             return False  # or reduce size to fit
 
-        # 2. Market exposure: total across all outcomes in this market
-        market_exposure = tracker.get_market_exposure(signal.market_id)
-        if market_exposure + signal.size > self.max_market_exposure:
+        # 2. Event exposure: total across all outcomes in this event
+        event_exposure = tracker.get_event_exposure(signal.event_id)
+        if event_exposure + signal.size > self.max_event_exposure:
             return False
 
         # 3. Portfolio exposure
@@ -809,10 +913,11 @@ class RiskManager:
         if total_exposure + signal.size > self.max_portfolio_exposure:
             return False
 
-        # 4. Daily loss limit
-        daily_pnl = tracker.get_daily_pnl()
-        if daily_pnl < -self.max_daily_loss:
-            return False
+        # 4. Balance checks
+        if tracker.get_usdc_balance() < self.min_balance:
+            return False  # insufficient cash to trade
+        if tracker.get_total_bankroll() < self.min_bankroll:
+            return False  # emergency pause
 
         # 5. Cooldown: recently traded this outcome?
         if tracker.is_on_cooldown(signal.token_id):
@@ -824,22 +929,6 @@ class RiskManager:
 
         return True
 ```
-
-### 8.3 Stop-Loss
-
-Unlike the market-maker which has a complex stop-loss tied to order management, the taker bot's stop-loss is simpler:
-
-- **Per-position stop-loss:** If a position's mark-to-market P&L falls below a threshold (e.g., -30% of entry value), generate a SELL signal at market price
-- **Implementation:** During each polling cycle, check all open positions against current Polymarket prices. If a position is down beyond the threshold, create a forced SELL signal that bypasses normal edge requirements
-- **Cooldown after stop-loss:** Don't re-enter the same position for a configurable period (e.g., 2 hours)
-
-### 8.4 Position Merging
-
-Keep from the market-maker bot: if the bot ends up holding both YES and NO tokens in the same market (possible in multi-outcome neg-risk markets where different outcomes are bought at different times), merge them on-chain to recover USDC.
-
-- Check for mergeable positions every polling cycle
-- If `min(YES_position, NO_position) > 10` for any condition_id, trigger merge
-- Reuse the Node.js merger subprocess approach from the market-maker bot
 
 ---
 
@@ -853,7 +942,6 @@ class Position:
     token_id: str
     outcome_name: str
     market_name: str
-    condition_id: str
     side: str              # "YES" or "NO"
     size: float            # number of shares held
     avg_cost: float        # average entry price
@@ -864,25 +952,71 @@ class Position:
 ```
 
 **Tracking approach:**
-- **Primary:** Local tracking updated on every fill event from User WebSocket (optimistic, instant)
-- **Secondary:** Periodic sync from Polymarket Data API (every 60s) as ground truth
+
+- **Primary:** Local tracking updated on each FOK/FAK API response (immediate fill confirmation)
+- **Secondary:** Periodic sync from Polymarket Data API (every 60s) as ground-truth backup
 - **Reconciliation:** If API position differs from local by > 5%, log a warning and adopt API values
 
-### 9.2 P&L Calculation
+### 9.2 Balance & Bankroll Tracking
+
+The bot tracks USDC balance and computes total portfolio value for monitoring and risk gate purposes. Kelly bet sizing uses a separate fixed `kelly_bankroll` from config (not the live balance).
+
+```python
+@dataclass
+class BankrollSnapshot:
+    usdc_balance: float        # USDC in wallet (on Polygon)
+    positions_value: float     # mark-to-market value of all open positions
+    total_bankroll: float      # usdc_balance + positions_value
+    timestamp: datetime
+```
+
+**Balance fetching:**
+
+- Query USDC balance on Polygon via `web3.py`: read the USDC ERC-20 contract's `balanceOf(wallet_address)`
+- USDC on Polygon uses 6 decimals (`raw_balance / 1e6`)
+- Fetched every polling cycle (alongside position sync) — lightweight RPC call
+
+**Bankroll calculation:**
+
+```
+usdc_balance    = web3.call(USDC_contract.balanceOf(wallet))
+positions_value = Σ (position.size × position.current_price) for all open positions
+total_bankroll  = usdc_balance + positions_value
+```
+
+The `total_bankroll` is used for monitoring and risk gate checks (e.g., `min_bankroll` emergency pause). Kelly bet sizing uses the fixed `kelly_bankroll` from config instead.
+
+**Balance logging:**
+
+- Logged every cycle at DEBUG level: `Balance: $847.20 | Positions: $152.80 | Bankroll: $1000.00`
+- Included in Telegram daily summary: `Bankroll: $1012.40 (+1.2%) | Cash: $860.20 | Positions: $152.20`
+- Saved to state.json for persistence across restarts
+
+**Alerts:**
+
+- If `usdc_balance` drops below a configurable `min_balance` threshold (e.g., $50), send a Telegram alert and pause new trades (existing positions are kept)
+- If `total_bankroll` drops below `min_bankroll` (e.g., $200), emergency alert — bot pauses all trading
+
+### 9.3 P&L Calculation
 
 ```
 Unrealized P&L = (current_price - avg_cost) × shares_held
 Realized P&L   = Σ (sell_price - avg_cost) × shares_sold  [for each closed trade]
 Total P&L      = Unrealized + Realized
-Daily P&L      = Total P&L since midnight UTC
 ```
 
-### 9.3 State Persistence
+### 9.4 State Persistence
 
 Bot state is saved to `data/state.json` on every position change and loaded on startup:
 
 ```json
 {
+  "bankroll": {
+    "usdc_balance": 847.20,
+    "positions_value": 152.80,
+    "total_bankroll": 1000.00,
+    "last_updated": "2026-03-19T14:35:00Z"
+  },
   "positions": {
     "token_abc123": {
       "size": 131,
@@ -893,41 +1027,7 @@ Bot state is saved to `data/state.json` on every position change and loaded on s
   },
   "cooldowns": {
     "token_abc123": "2026-03-19T15:00:00Z"
-  },
-  "daily_pnl": {
-    "2026-03-19": -5.20
-  },
-  "trade_history": [
-    {
-      "timestamp": "2026-03-19T14:30:00Z",
-      "token_id": "token_abc123",
-      "side": "BUY",
-      "size": 97,
-      "price": 0.19,
-      "edge": 0.06,
-      "fair_value": 0.25,
-      "kelly_fraction_used": 0.25,
-      "kelly_bet_usd": 18.50,
-      "confidence": 0.85,
-      "market_name": "2026 NHL Stanley Cup Champion",
-      "outcome": "Toronto Maple Leafs",
-      "reason": "edge_detected",
-      "odds_snapshot": {
-        "betano": 4.50,
-        "bet365": 4.40,
-        "draftkings": 4.45,
-        "fanduel": 4.55,
-        "betmgm": 4.60,
-        "caesars": 4.50
-      },
-      "polymarket_snapshot": {
-        "best_bid": 0.18,
-        "best_ask": 0.19,
-        "bid_liquidity": 500,
-        "ask_liquidity": 200
-      }
-    }
-  ]
+  }
 }
 ```
 
@@ -946,17 +1046,27 @@ polymarket:
 
 # Polling and execution
 engine:
-  poll_interval: 60          # seconds between evaluation cycles
-  position_sync_interval: 60 # seconds between API position syncs
+  dry_run: false             # set to true (or use --dry-run flag) to log signals without executing
+  position_sync_interval: 60 # seconds between API position syncs + balance checks
   ws_ping_interval: 5        # WebSocket keepalive interval
+  # Note: scraper intervals are configured per-scraper (see scrapers section)
 
 # Risk management defaults (can be overridden per market)
 risk:
-  max_position_size: 100     # USD per outcome
-  max_market_exposure: 300   # USD per market (all outcomes)
-  max_portfolio_exposure: 1000  # USD total
-  max_daily_loss: 50         # USD — stop trading for the day
+  kelly_bankroll: 1000         # USD — fixed bankroll for Kelly bet sizing (set manually)
+  max_outcome_exposure: 200    # USD per outcome (e.g., one team)
+  max_event_exposure: 500      # USD per event (all outcomes combined)
+  max_portfolio_exposure: 1000 # USD total
+  min_balance: 50              # USD — pause new trades if USDC balance drops below this
+  min_bankroll: 200            # USD — emergency pause if total bankroll drops below this
   default_cooldown_minutes: 30
+
+# Enabled scrapers (each runs independently on its own interval)
+scrapers:
+  - name: odds_aggregator        # covers NHL, NBA events
+    interval: 60                  # scrape every 60 seconds
+  # - name: soccer_scraper
+  #   interval: 300               # scrape every 5 minutes
 
 # Enabled markets (list of plugin directory names)
 enabled_markets:
@@ -968,6 +1078,14 @@ logging:
   file: data/logs/bot.log
   console: true
   trade_log: data/logs/trades.log  # separate file for trade events only
+
+# Telegram alerts
+telegram:
+  enabled: true
+  # TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID loaded from .env
+  send_trades: true            # alert on every trade execution
+  send_errors: true            # alert on failures
+  send_daily_summary: true     # P&L summary at midnight UTC
 ```
 
 ### 10.2 Environment Variables (`.env`)
@@ -975,6 +1093,8 @@ logging:
 ```
 PK=0x...                          # Private key of Safe owner EOA
 BROWSER_ADDRESS=0x...             # Gnosis Safe contract address
+TELEGRAM_BOT_TOKEN=...            # Telegram bot token from @BotFather
+TELEGRAM_CHAT_ID=...              # Telegram chat ID for alerts
 ```
 
 ---
@@ -983,21 +1103,23 @@ BROWSER_ADDRESS=0x...             # Gnosis Safe contract address
 
 ### 11.1 Log Levels
 
-| Level | What Gets Logged |
-|---|---|
-| **DEBUG** | Raw sportsbook responses, order book snapshots, all price calculations |
-| **INFO** | Trade signals (generated, approved, rejected), order placements, fills, position changes |
-| **WARNING** | Data source failures, stale data, position reconciliation mismatches, partial fills |
-| **ERROR** | API errors, WebSocket disconnects, order rejections, authentication failures |
+
+| Level       | What Gets Logged                                                                         |
+| ----------- | ---------------------------------------------------------------------------------------- |
+| **DEBUG**   | Raw sportsbook responses, order book snapshots, all price calculations                   |
+| **INFO**    | Trade signals (generated, approved, rejected), order placements, fills, position changes |
+| **WARNING** | Data source failures, stale data, position reconciliation mismatches, partial fills      |
+| **ERROR**   | API errors, WebSocket disconnects, order rejections, authentication failures             |
+
 
 ### 11.2 Key Log Events
 
 ```
-[INFO]  Signal: BUY Leafs YES | fair=0.250 ask=0.190 edge=0.060 conf=0.85 sources=5 kelly=$18.50
-[INFO]  Risk: APPROVED | pos=$0/$100 | market=$0/$300 | portfolio=$0/$1000
-[INFO]  Order: FOK BUY 97 shares @ 0.19 | token=abc123
-[INFO]  Fill: FILLED 97 shares @ 0.19 | cost=$18.43 | pos now 97 @ 0.19
-[INFO]  P&L: Leafs YES | unrealized=$0.00 | realized=$0.00 | daily=$-18.43
+[INFO]  Signal: BUY Leafs YES | fair=0.200 ask=0.180 edge=10.0% sources=5 kelly=$6.00
+[INFO]  Risk: APPROVED | pos=$0/$200 | event=$0/$500 | portfolio=$0/$1000
+[INFO]  Order: FOK BUY 33 shares @ 0.18 | token=abc123
+[INFO]  Fill: FILLED 33 shares @ 0.18 | cost=$5.94 | pos now 33 @ 0.18
+[INFO]  P&L: Leafs YES | unrealized=$0.00 | realized=$0.00 | daily=$-5.94
 [INFO]  Exit: SELL Leafs YES | reason=edge_disappeared | fair=0.19 bid=0.21 | +$1.94
 
 [WARNING] Stale data: bet365 NHL Stanley Cup last updated 15m ago
@@ -1007,67 +1129,55 @@ BROWSER_ADDRESS=0x...             # Gnosis Safe contract address
 [ERROR] Order rejected: insufficient balance
 ```
 
-### 11.3 Trade Snapshot Log
-
-Every trade (entry or exit) saves a **full market snapshot** — the odds from every data source at the time of execution. This is critical for later analysis of model accuracy and edge decay.
-
-**Saved as JSON, one file per trade:** `data/snapshots/{timestamp}_{outcome}_{side}.json`
-
-```json
-{
-  "timestamp": "2026-03-19T14:30:00Z",
-  "market": "2026 NHL Stanley Cup Champion",
-  "outcome": "Toronto Maple Leafs",
-  "side": "BUY",
-  "execution": {
-    "size_shares": 97,
-    "price": 0.19,
-    "size_usd": 18.43,
-    "fill_status": "FILLED",
-    "order_type": "FOK"
-  },
-  "signal": {
-    "fair_value": 0.25,
-    "edge": 0.06,
-    "confidence": 0.85,
-    "kelly_bet_usd": 18.50,
-    "kelly_fraction": 0.25
-  },
-  "odds_snapshot": {
-    "betano": {"decimal": 4.50, "implied_prob": 0.222, "devigged_prob": 0.193, "timestamp": "2026-03-19T14:29:45Z"},
-    "bet365": {"decimal": 4.40, "implied_prob": 0.227, "devigged_prob": 0.198, "timestamp": "2026-03-19T14:29:50Z"},
-    "draftkings": {"decimal": 4.45, "implied_prob": 0.225, "devigged_prob": 0.195, "timestamp": "2026-03-19T14:29:48Z"},
-    "fanduel": {"decimal": 4.55, "implied_prob": 0.220, "devigged_prob": 0.191, "timestamp": "2026-03-19T14:29:52Z"},
-    "betmgm": {"decimal": 4.60, "implied_prob": 0.217, "devigged_prob": 0.189, "timestamp": "2026-03-19T14:29:47Z"},
-    "caesars": {"decimal": 4.50, "implied_prob": 0.222, "devigged_prob": 0.193, "timestamp": "2026-03-19T14:29:49Z"}
-  },
-  "polymarket_snapshot": {
-    "best_bid": 0.18,
-    "best_ask": 0.19,
-    "bid_depth_100": 500,
-    "ask_depth_100": 200,
-    "gamma_best_bid": 0.18,
-    "gamma_best_ask": 0.19
-  },
-  "position_after": {
-    "size": 97,
-    "avg_cost": 0.19,
-    "total_exposure_usd": 18.43
-  }
-}
-```
-
-This snapshot enables post-hoc analysis: did the sportsbooks agree? Was the edge real? How much did the price move after our trade? Did the model's fair value prove accurate?
-
-### 11.4 Trade Summary Log
+### 11.3 Trade Summary Log
 
 A compact CSV log for quick P&L review:
 
 ```csv
-timestamp,market,outcome,side,shares,price,usd,edge,fair_value,kelly_usd,confidence,sources,fill,reason
-2026-03-19T14:30:00Z,Stanley Cup,Leafs,BUY,97,0.19,18.43,0.060,0.250,18.50,0.85,5,FILLED,edge_detected
-2026-03-20T09:15:00Z,Stanley Cup,Leafs,SELL,97,0.21,20.37,0.000,0.190,0,0.82,5,FILLED,edge_disappeared
+timestamp,event,outcome,side,shares,price,usd,edge_pct,fair_value,kelly_usd,sources,fill,reason
+2026-03-19T14:30:00Z,Stanley Cup,Leafs,BUY,33,0.18,5.94,10.0,0.200,6.00,5,FILLED,edge_detected
+2026-03-20T09:15:00Z,Stanley Cup,Leafs,SELL,33,0.21,6.93,0.0,0.210,0,5,FILLED,edge_disappeared
 ```
+
+### 11.4 Telegram Alerts
+
+Real-time push notifications via a Telegram bot for critical events. The bot sends messages to a configured Telegram chat (personal or group).
+
+**Setup:**
+
+- Create a Telegram bot via @BotFather → get bot token
+- Get your chat ID
+- Add credentials to `.env`:
+  ```
+  TELEGRAM_BOT_TOKEN=...
+  TELEGRAM_CHAT_ID=...
+  ```
+
+**Alert types:**
+
+
+| Event                    | Priority | Message                                            |
+| ------------------------ | -------- | -------------------------------------------------- |
+| **Trade executed**       | Normal   | `BUY 97 Leafs YES @ 0.19                           |
+| **Trade failed**         | High     | `FOK REJECTED: Leafs YES — insufficient liquidity` |
+| **Daily P&L summary**    | Normal   | `Daily P&L: +$12.40 | 3 trades | 2 wins`           |
+| **Exit trade**           | Normal   | `SELL 33 Leafs YES @ 0.21 — edge disappeared (+$0.99)` |
+| **Data source down**     | Medium   | `WARNING: bet365 NHL odds stale for 30+ min`       |
+| **WebSocket disconnect** | Medium   | `WS disconnected — reconnecting...`                |
+| **Bot startup/shutdown** | Normal   | `Bot started (dry-run: false)                      |
+
+
+**Implementation:** A lightweight `TelegramNotifier` class using the Telegram Bot API (simple HTTP POST, no heavy SDK needed):
+
+```python
+class TelegramNotifier:
+    async def send(self, message: str, priority: str = "normal"):
+        """Send a message via Telegram Bot API."""
+        # POST to https://api.telegram.org/bot{token}/sendMessage
+        # High priority messages use parse_mode=HTML for bold formatting
+```
+
+Alerts are **non-blocking** — if Telegram is unreachable, log the failure and continue trading. Never let notification failures affect the trading loop.
 
 ---
 
@@ -1075,140 +1185,154 @@ timestamp,market,outcome,side,shares,price,usd,edge,fair_value,kelly_usd,confide
 
 ### Keep (adapt for taker)
 
-| Component | Why | Adaptation |
-|---|---|---|
-| **Authentication** (PK, BROWSER_ADDRESS, signature_type=2) | Required for any Polymarket trading | Direct reuse |
-| **ClobClient initialization** | API key derivation, HTTP client setup | Direct reuse |
-| **WebSocket connections** | Real-time price data + fill tracking | Keep both Market WS and User WS |
-| **Order book storage** (SortedDict) | Need to know available liquidity | Keep, but read-only (we don't post passive orders) |
-| **Position tracking** (local + API sync) | Must know what we hold | Simplify — no need for `performing` set complexity |
-| **Position merging** (Node.js subprocess) | Recover capital from YES+NO overlap | Direct reuse |
-| **On-chain approvals** | Required before first trade | Direct reuse |
-| **Auto-reconnect for WebSockets** | Must stay connected 24/7 | Direct reuse |
-| **User WS trade lifecycle** (MATCHED → CONFIRMED → MINED) | Track fill status | Simplify — we mainly care about MATCHED for position updates |
+
+| Component                                                  | Why                                   | Adaptation                                                                                                              |
+| ---------------------------------------------------------- | ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| **Authentication** (PK, BROWSER_ADDRESS, signature_type=2) | Required for any Polymarket trading   | Direct reuse                                                                                                            |
+| **ClobClient initialization**                              | API key derivation, HTTP client setup | Direct reuse                                                                                                            |
+| **WebSocket connections**                                  | Real-time price data                  | Keep Market WS for live order book                                                                                      |
+| **Order book storage** (SortedDict)                        | Need to know available liquidity      | Keep, but read-only (we don't post passive orders)                                                                      |
+| **Position tracking** (local + API sync)                   | Must know what we hold                | Simplify — FOK/FAK API responses give immediate fill confirmation; periodic API sync (every 60s) as ground-truth backup |
+| **On-chain approvals**                                     | Required before first trade           | Direct reuse                                                                                                            |
+| **Auto-reconnect for WebSockets**                          | Must stay connected 24/7              | Direct reuse                                                                                                            |
+
 
 ### Discard
 
-| Component | Why |
-|---|---|
-| **Google Sheets for config** | Overkill for a taker bot — use YAML config files instead. Sheets made sense for the maker because a human was constantly adjusting markets and hyperparameters. The taker bot's config changes rarely. |
-| **Market discovery / reward calculation** (`update_markets.py`, `find_markets.py`) | We don't earn maker rewards. Market selection is manual (config-driven), not algorithmic. |
-| **Spread management / order pricing at inside of spread** | We don't post passive orders. We take existing liquidity. |
-| **Dual-sided order management** (maintain bid AND ask) | We make directional bets, not market-making spreads. |
-| **Order replacement optimization** (only cancel if >0.5c / >10% change) | We don't maintain standing orders. Each trade is one-shot. |
-| **Volatility calculation and gating** | Volatility matters for market makers who risk getting picked off. As takers, we only trade when we see edge — volatility is handled implicitly by the edge threshold. |
-| **Stats updater** (`update_stats.py`) | Replace with simple logging. No need for a separate process writing to Sheets. |
-| **Sentiment ratio** (bid/ask volume comparison) | Market-making signal, not relevant for directional taking. |
-| **Price sanity check vs sheet reference** | Replace with confidence score and multi-source agreement. |
-| **Sleep period / cooldown after stop-loss** (file-based) | Replace with in-memory cooldown tracker (persisted to state.json). |
-| **`performing` set** | Needed for the maker's optimistic updates during rapid order cycling. The taker executes FOK orders and gets an immediate result — no in-flight ambiguity. |
-| **Multiplier for cheap tokens** | Maker-specific sizing heuristic. Taker sizing is driven by edge and risk limits. |
+
+| Component                                                                          | Why                                                                                                                                                                                                    |
+| ---------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Google Sheets for config**                                                       | Overkill for a taker bot — use YAML config files instead. Sheets made sense for the maker because a human was constantly adjusting markets and hyperparameters. The taker bot's config changes rarely. |
+| **Market discovery / reward calculation** (`update_markets.py`, `find_markets.py`) | We don't earn maker rewards. Market selection is manual (config-driven), not algorithmic.                                                                                                              |
+| **Spread management / order pricing at inside of spread**                          | We don't post passive orders. We take existing liquidity.                                                                                                                                              |
+| **Dual-sided order management** (maintain bid AND ask)                             | We make directional bets, not market-making spreads.                                                                                                                                                   |
+| **Order replacement optimization** (only cancel if >0.5c / >10% change)            | We don't maintain standing orders. Each trade is one-shot.                                                                                                                                             |
+| **Volatility calculation and gating**                                              | Volatility matters for market makers who risk getting picked off. As takers, we only trade when we see edge — volatility is handled implicitly by the edge threshold.                                  |
+| **Stats updater** (`update_stats.py`)                                              | Replace with simple logging + Telegram alerts. No need for a separate process writing to Sheets.                                                                                                       |
+| **Sentiment ratio** (bid/ask volume comparison)                                    | Market-making signal, not relevant for directional taking.                                                                                                                                             |
+| **Price sanity check vs sheet reference**                                          | Replace with multi-source agreement (`min_sources`).                                                                                                                                                   |
+| **Sleep period / cooldown after stop-loss** (file-based)                           | No stop-loss. Cooldown after trades uses in-memory tracker (persisted to state.json).                                                                                                                   |
+| `**performing` set**                                                               | Needed for the maker's optimistic updates during rapid order cycling. The taker executes FOK orders and gets an immediate result — no in-flight ambiguity.                                             |
+| **Multiplier for cheap tokens**                                                    | Maker-specific sizing heuristic. Taker sizing is driven by edge and risk limits.                                                                                                                       |
+
 
 ### Transform
 
-| Market-Maker Concept | Market-Taker Equivalent |
-|---|---|
-| Continuously quote both sides | Place one-shot directional orders when edge exists |
-| React to every order book tick | Poll on a 30-60s cycle (futures odds change slowly) |
-| Earn the spread + maker rewards | Earn from mispricing edge (fair value vs market price) |
-| Manage inventory risk (building too much of one side) | Manage directional risk (position limits, stop-loss) |
-| Price based on order book (inside the spread) | Price based on external data (sportsbook-derived fair value) |
-| GTC limit orders (passive, wait for fill) | FOK/FAK orders (aggressive, immediate fill or cancel) |
+
+| Market-Maker Concept                                  | Market-Taker Equivalent                                      |
+| ----------------------------------------------------- | ------------------------------------------------------------ |
+| Continuously quote both sides                         | Place one-shot directional orders when edge exists           |
+| React to every order book tick                        | Poll on a 30-60s cycle (futures odds change slowly)          |
+| Earn the spread + maker rewards                       | Earn from mispricing edge (fair value vs market price)       |
+| Manage inventory risk (building too much of one side) | Manage directional risk (position limits, hold to resolution) |
+| Price based on order book (inside the spread)         | Price based on external data (sportsbook-derived fair value) |
+| GTC limit orders (passive, wait for fill)             | FOK/FAK orders (aggressive, immediate fill or cancel)        |
+
 
 ---
 
 ## 13. Implementation Phases
 
-### Phase 1: Foundation (Core Engine + Polymarket Client)
+### Phase 1: Foundation (Polymarket Client + Data Models)
 
 **Goal:** Connect to Polymarket, authenticate, read prices, and place a test order.
 
 1. Set up project structure and dependencies
-2. Implement `polymarket_client.py`:
-   - Authentication (PK, BROWSER_ADDRESS, ClobClient)
-   - Gamma API: fetch event by slug → get token IDs, prices
-   - CLOB API: fetch order book, place order, cancel order
-   - Basic WebSocket: connect to Market WS, receive price updates
-3. Implement `state.py`: save/load state to JSON
-4. Implement `models.py`: data classes
+2. Implement `core/models.py`: data classes (Signal, Position, Order, PriceInfo, etc.)
+3. Implement `core/polymarket_client.py`:
+  - Authentication (PK, BROWSER_ADDRESS, ClobClient)
+  - Gamma API: fetch event by slug → get token IDs, prices
+  - CLOB API: fetch order book, place order, cancel order
+  - `get_usdc_balance()`: query USDC balance on Polygon via web3
+  - Market WebSocket: connect to Market WS, receive price updates
+4. Implement `core/state.py`: save/load state to JSON
 5. **Test:** manually place a small FOK order on a test market to verify the full auth + execution flow works
 
-### Phase 2: First Market Plugin (NHL Stanley Cup)
+### Phase 2: Scraper Interface + First Market Plugin (NHL Stanley Cup)
 
-**Goal:** Fetch sportsbook odds, compute fair values, generate signals.
+**Goal:** Define scraper output format, compute fair values, generate signals.
 
-1. Implement `markets/base.py` (plugin interface)
-2. Implement `markets/nhl_stanley_cup/`:
-   - `data_sources.py`: fetch odds from configured sportsbooks
-   - `fair_value.py`: vig removal, aggregation, sharp-book weighting
-   - `plugin.py`: tie it together
-   - `config.yaml`: team mappings, trade params
-3. Implement `core/signal.py`: signal evaluation logic + Kelly criterion bet sizing
-4. **Test:** verify fair value calculations against manual spreadsheet. Verify Kelly sizing produces sensible bet sizes across a range of edges/prices. Run signal generation in dry-run mode (log signals but don't execute).
+1. Implement `scrapers/models.py`: `ScrapedOdds`, `EventOdds`, `BookOdds` data classes
+2. Implement `scrapers/base.py`: abstract scraper interface (`BaseScraper`)
+3. Implement a **stub scraper** that returns hardcoded/mock `ScrapedOdds` for testing (real scrapers built separately)
+4. Implement `markets/base.py` (plugin interface with `extract_odds()`)
+5. Implement `markets/nhl_stanley_cup/`:
+  - `fair_value.py`: vig removal, aggregation, configurable book weighting
+  - `plugin.py`: `extract_odds()` filtering + name mapping, ties everything together
+  - `config.yaml`: outcome mappings, event key, trade params
+6. Implement `core/signal.py`: signal evaluation (relative edge) + Kelly criterion bet sizing
+7. Implement `--dry-run` flag (CLI argument + config option)
+8. **Test:** verify fair value calculations against manual spreadsheet. Verify Kelly sizing produces sensible bet sizes across a range of edges/prices. Run signal generation in dry-run mode (log signals but don't execute).
 
-### Phase 3: Execution & Risk Management
+### Phase 3: Execution, Risk & Monitoring
 
-**Goal:** Execute real trades with proper risk controls.
+**Goal:** Execute real trades with proper risk controls, logging, and alerts.
 
-1. Implement `core/executor.py`: order placement with FOK, liquidity checks, trade snapshot logging
-2. Implement `core/risk_manager.py`: all risk gates
-3. Implement `core/position_tracker.py`: position tracking, P&L
-4. Implement exit logic: edge-disappearance sell strategy, stop-loss
-5. Connect User WebSocket for fill tracking
-6. Implement `core/engine.py`: main loop tying everything together (entry signals + exit checks each cycle)
-7. **Test:** run with very small position sizes ($5-10) on the live market. Monitor fills, P&L, and signal accuracy.
+1. Implement `core/executor.py`: order placement with FOK (FAK fallback), liquidity checks
+2. Implement `core/risk_manager.py`: all risk gates (exposure limits, balance checks, cooldowns)
+3. Implement `core/position_tracker.py`: position tracking, P&L, balance/bankroll monitoring
+4. Implement exit logic: sell when market bid reaches fair value (edge disappeared)
+5. Implement CSV trade logging
+6. Implement `core/notifier.py`: Telegram alerts (trades, errors, daily summary)
+7. Implement `core/engine.py`: independent scraper loops (`asyncio.create_task` per scraper), each triggering the signal → risk → execute pipeline on completion
+8. **Test:** run with very small position sizes ($5-10) on the live market. Monitor fills, P&L, and signal accuracy via CSV log and Telegram alerts.
 
-### Phase 4: Monitoring & Hardening
+### Phase 4: Hardening
 
-**Goal:** Production-ready with proper logging and error handling.
+**Goal:** Production-ready with robust error handling.
 
-1. Structured logging with trade snapshot logs (full odds from all sources at time of each trade)
-2. Graceful shutdown (save state on SIGINT)
-3. Error recovery (API failures, WebSocket disconnects, stale data)
-4. Position merging integration
-5. **Validate:** run for 2+ weeks, analyze trade snapshots for:
-   - Signal accuracy (% of trades that end profitable)
-   - Edge decay (does edge disappear by the time we execute?)
-   - P&L after fees
-   - Data source reliability
+1. Graceful shutdown (save state on SIGINT)
+2. Error recovery (API failures, WebSocket disconnects, scraper failures)
+3. Auto-reconnect for WebSocket with backoff
+4. **Validate:** run for 2+ weeks, analyze trade logs for:
+  - Signal accuracy (% of trades that end profitable)
+  - Edge decay (does edge disappear by the time we execute?)
+  - P&L after fees
+  - Data source reliability
 
-### Phase 5: Expand to More Markets
+### Phase 5: Expand to More Events
 
-**Goal:** Add more markets using the plugin system.
+**Goal:** Add more events using the plugin system.
 
-1. Create plugins for additional markets (other NHL divisions, conferences, Stanley Cup)
-2. Potentially expand to other sports or non-sports markets
+1. Create plugins for additional events (other NHL divisions, conferences) — no scraper changes needed if already scraped
+2. Potentially expand to other sports or non-sports events
 3. Refine edge thresholds and position sizing based on Phase 4 learnings
-4. Consider shared data source modules (e.g., one sportsbook fetcher reused across all NHL markets)
 
 ---
 
 ## 14. Technical Decisions
 
 ### Language & Runtime
+
 - **Python 3.11+** — async/await for WebSockets, rich ecosystem for data work
-- **`uv`** for package management (fast, reliable)
+- `**uv`** for package management (fast, reliable)
 
 ### Key Dependencies
-| Package | Purpose |
-|---|---|
-| `py-clob-client` | Polymarket CLOB API client (order signing, placement) |
-| `web3` | Polygon RPC for on-chain operations (balance checks, merging) |
-| `websockets` | Real-time market data + user event streams |
-| `curl_cffi` | HTTP requests with browser TLS fingerprinting (for sportsbook scraping) |
-| `pyyaml` | Configuration file parsing |
-| `sortedcontainers` | Efficient order book storage (SortedDict) |
-| `eth-account` | Ethereum key management |
-| `python-dotenv` | Load .env file |
+
+
+| Package            | Purpose                                                                 |
+| ------------------ | ----------------------------------------------------------------------- |
+| `py-clob-client`   | Polymarket CLOB API client (order signing, placement)                   |
+| `web3`             | Polygon RPC for on-chain operations (balance checks, approvals)         |
+| `websockets`       | Real-time market data stream                                            |
+| `curl_cffi`        | HTTP requests with browser TLS fingerprinting (for sportsbook scraping) |
+| `pyyaml`           | Configuration file parsing                                              |
+| `sortedcontainers` | Efficient order book storage (SortedDict)                               |
+| `python-dotenv`    | Load .env file                                                          |
+
 
 ### Why Not Google Sheets?
+
 The market-maker uses Sheets because a human operator frequently adjusts which markets to trade and tweaks hyperparameters. A market-taking bot's config changes rarely — new markets are added occasionally, and thresholds are tuned after analysis, not in real-time. YAML files are simpler, version-controlled, and don't require Google API credentials.
 
 ### Why Polling Instead of Pure WebSocket?
-Sportsbook odds for futures markets change a few times per day, not sub-second. A 30-60 second polling cycle is more than sufficient and vastly simpler than reverse-engineering proprietary WebSocket protocols from 6 sportsbooks. The Polymarket side uses WebSockets for real-time price data, but signal generation is driven by the slower sportsbook polling cadence.
+
+Sportsbook odds for futures markets change a few times per day, not sub-second. Polling on scraper-specific intervals (30s to 5min depending on the source) is more than sufficient. Each scraper runs independently on its own schedule, and the downstream pipeline (fair value computation, signal evaluation, order placement) completes in under 1 second. The Polymarket side uses WebSockets for real-time price data, but signal generation is driven by the slower sportsbook polling cadence.
 
 ### Order Type Choice: FOK over GTC
+
 A GTC order that doesn't immediately fill sits on the order book as a passive limit order. This is problematic because:
+
 1. The fair value may change while the order sits
 2. We become a de facto market maker, exposed to adverse selection
 3. We'd need to manage order lifecycle (cancel stale orders, etc.)

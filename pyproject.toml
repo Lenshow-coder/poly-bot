@@ -1,0 +1,21 @@
+[project]
+name = "poly-bot"
+version = "0.1.0"
+description = "Market-taking bot for Polymarket"
+requires-python = ">=3.11"
+dependencies = [
+    "py-clob-client",
+    "web3",
+    "websockets",
+    "curl-cffi",
+    "requests",
+    "pyyaml",
+    "sortedcontainers",
+    "python-dotenv",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+]

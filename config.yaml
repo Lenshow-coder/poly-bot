@@ -1,0 +1,20 @@
+polymarket:
+  clob_url: "https://clob.polymarket.com"
+  gamma_url: "https://gamma-api.polymarket.com"
+  data_url: "https://data-api.polymarket.com"
+  ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+  chain_id: 137
+  signature_type: 2
+
+polygon:
+  rpc_url: "https://polygon-rpc.com"
+  usdc_address: "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+
+engine:
+  default_order_type: "FOK"
+  ws_ping_interval: 5
+  ws_reconnect_delay: 5
+
+logging:
+  level: "INFO"
+  console: true
