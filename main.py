@@ -15,8 +15,8 @@ def main():
     logger.info("Initializing Polymarket client...")
     client = PolymarketClient(config)
 
-    balance = client.get_usdc_balance()
-    logger.info(f"USDC balance: ${balance:.2f}")
+    exchange_balance = client.get_exchange_balance()
+    logger.info(f"Exchange balance: ${exchange_balance:.2f}")
     logger.info("Poly-bot ready.")
 
 

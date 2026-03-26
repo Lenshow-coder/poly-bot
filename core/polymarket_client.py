@@ -137,10 +137,21 @@ class PolymarketClient:
     # ── REST: Balance ────────────────────────────────────────────────
 
     def get_usdc_balance(self) -> float:
+        """USDC sitting in the wallet (not deposited into Polymarket)."""
         raw = self.usdc_contract.functions.balanceOf(
             Web3.to_checksum_address(self.browser_address)
         ).call()
         return raw / 1e6
+
+    def get_exchange_balance(self) -> float:
+        """USDC deposited into Polymarket exchange (available for trading)."""
+        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+        params = BalanceAllowanceParams(
+            asset_type=AssetType.COLLATERAL,
+            signature_type=self.config["polymarket"]["signature_type"],
+        )
+        result = self.clob.get_balance_allowance(params)
+        return int(result.get("balance", 0)) / 1e6
 
     # ── REST: Order Placement ────────────────────────────────────────
 

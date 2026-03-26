@@ -97,8 +97,10 @@ def main():
     # ── Step 4: USDC balance ─────────────────────────────────────────
     print("\n=== Step 4: USDC Balance ===")
     try:
-        balance = client.get_usdc_balance()
-        print(f"  Balance: ${balance:.2f}")
+        wallet_balance = client.get_usdc_balance()
+        exchange_balance = client.get_exchange_balance()
+        print(f"  Wallet (not deposited): ${wallet_balance:.2f}")
+        print(f"  Exchange (available to trade): ${exchange_balance:.2f}")
     except Exception as e:
         print(f"  [FAIL] {e}")
 
