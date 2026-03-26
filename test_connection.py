@@ -5,6 +5,7 @@ Usage:
     python test_connection.py --slug <event-slug>
     python test_connection.py --slug <event-slug> --place-order
     python test_connection.py --slug <event-slug> --fill-order
+    python test_connection.py --slug <event-slug> --ws-test
 """
 
 import argparse
@@ -17,6 +18,8 @@ from core.polymarket_client import PolymarketClient
 from core.state import StateManager
 from core.models import BankrollSnapshot, Position
 from datetime import datetime, timezone
+
+WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 
 def main():
@@ -32,10 +35,15 @@ def main():
         action="store_true",
         help="Place a $1 FOK BUY at best ask (WILL fill — costs real money)",
     )
+    parser.add_argument(
+        "--ws-test",
+        action="store_true",
+        help="Connect to market WebSocket for 30s and print incoming messages",
+    )
     args = parser.parse_args()
 
     config = load_config()
-    logger = setup_logging(level="DEBUG", console=True)
+    logger = setup_logging(level="INFO", console=True)
     ensure_data_dir()
 
     # ── Step 1: Init client (verifies auth) ──────────────────────────
@@ -55,9 +63,7 @@ def main():
         print(f"  Neg-risk: {event.neg_risk}")
         print(f"  Markets: {len(event.markets)}")
         for m in event.markets[:5]:
-            bid_str = f"{m.best_bid:.3f}" if m.best_bid else "N/A"
-            ask_str = f"{m.best_ask:.3f}" if m.best_ask else "N/A"
-            print(f"    {m.outcome_name}: bid={bid_str} ask={ask_str} yes_token={m.yes_token_id[:12]}...")
+            print(f"    {m.outcome_name}: yes_token={m.yes_token_id[:12]}...")
         if len(event.markets) > 5:
             print(f"    ... and {len(event.markets) - 5} more")
     except Exception as e:
@@ -72,21 +78,16 @@ def main():
         try:
             book = client.get_order_book(first_market.yes_token_id)
 
-            # Handle both object and dict formats
-            bids = getattr(book, "bids", None) or (book.get("bids") if isinstance(book, dict) else []) or []
-            asks = getattr(book, "asks", None) or (book.get("asks") if isinstance(book, dict) else []) or []
+            bids = getattr(book, "bids", None) or []
+            asks = getattr(book, "asks", None) or []
 
             print(f"  Bids: {len(bids)} levels")
             for b in bids[:3]:
-                p = b.price if hasattr(b, "price") else b["price"]
-                s = b.size if hasattr(b, "size") else b["size"]
-                print(f"    {p} x {s}")
+                print(f"    {b.price} x {b.size}")
 
             print(f"  Asks: {len(asks)} levels (sorted ascending)")
             for a in asks[:3]:
-                p = a.price if hasattr(a, "price") else a["price"]
-                s = a.size if hasattr(a, "size") else a["size"]
-                print(f"    {p} x {s}")
+                print(f"    {a.price} x {a.size}")
 
             prices = client.get_prices(first_market.yes_token_id)
             print(f"  Best bid: {prices.best_bid}, Best ask: {prices.best_ask}, Mid: {prices.midpoint}")
@@ -121,7 +122,6 @@ def main():
                 side="BUY",
                 size=10.0,
                 avg_cost=0.45,
-                current_price=0.50,
             )
         ]
 
@@ -139,9 +139,7 @@ def main():
     if args.place_order and first_market:
         print("\n=== Step 6: Place $1 FOK BUY below market ===")
         try:
-            # Use Gamma best_ask or CLOB price, place well below
-            clob_ask = prices.best_ask if prices else None
-            ref_price = first_market.best_ask or clob_ask or 0.50
+            ref_price = prices.best_ask if prices else 0.50
             test_price = round(max(0.01, ref_price - 0.20), 2)
             shares = round(1.0 / test_price, 2)
 
@@ -167,12 +165,13 @@ def main():
     if args.fill_order and first_market:
         print("\n=== Step 7: Place $1 FOK BUY at best ask (WILL FILL) ===")
         try:
-            clob_ask = prices.best_ask if prices else None
-            fill_price = first_market.best_ask or clob_ask
+            fill_price = prices.best_ask if prices else None
             if not fill_price:
                 print("  [SKIP] No ask price available")
             else:
-                shares = round(1.0 / fill_price, 2)
+                import math
+                # Ceil to whole shares to meet $1 minimum order size
+                shares = float(math.ceil(1.0 / fill_price))
                 print(f"  Placing: BUY {shares} shares @ ${fill_price}")
                 result = client.place_order(
                     token_id=first_market.yes_token_id,
@@ -186,6 +185,61 @@ def main():
                 print(f"  Filled: {result.filled_size} @ {result.filled_price}")
         except Exception as e:
             print(f"  [FAIL] {e}")
+
+    # ── Step 8: WebSocket smoke test ──────────────────────────────
+    if args.ws_test and event.markets:
+        import asyncio
+        import websockets as ws_lib
+
+        print("\n=== Step 8: WebSocket smoke test (30s) ===")
+        token_ids = [m.yes_token_id for m in event.markets[:3]]
+        ws_duration = 30
+        messages_received = []
+
+        async def ws_test():
+            try:
+                async with ws_lib.connect(WS_URL, ping_interval=5) as ws:
+                    subscribe_msg = json.dumps(
+                        {
+                            "type": "subscribe",
+                            "channel": "market",
+                            "assets_ids": token_ids,
+                        }
+                    )
+                    await ws.send(subscribe_msg)
+                    print(f"  Subscribed to {len(token_ids)} tokens, listening for {ws_duration}s...")
+
+                    async def listen():
+                        async for raw_msg in ws:
+                            msg = json.loads(raw_msg)
+                            # WS may return a list of book snapshots or a dict
+                            if isinstance(msg, list):
+                                event_type = "book_snapshot"
+                                n_books = len(msg)
+                            else:
+                                event_type = msg.get("event_type", msg.get("type", "unknown"))
+                                n_books = None
+                            messages_received.append(event_type)
+                            if len(messages_received) <= 5:
+                                detail = f" ({n_books} books)" if n_books else ""
+                                print(f"  [{len(messages_received)}] {event_type}{detail}")
+                            elif len(messages_received) == 6:
+                                print("  ... (suppressing further output, counting messages)")
+
+                    await asyncio.wait_for(listen(), timeout=ws_duration)
+            except asyncio.TimeoutError:
+                pass
+            except Exception as e:
+                print(f"  [FAIL] WebSocket error: {e}")
+                return
+
+            total = len(messages_received)
+            if total > 0:
+                print(f"  [OK] Received {total} messages in {ws_duration}s")
+            else:
+                print(f"  [WARN] No messages received in {ws_duration}s — market may be inactive")
+
+        asyncio.run(ws_test())
 
     print("\n=== All tests complete ===")
 
