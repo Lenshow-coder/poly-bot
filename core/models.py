@@ -72,3 +72,21 @@ class BankrollSnapshot:
     @classmethod
     def from_dict(cls, d: dict) -> "BankrollSnapshot":
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
+class Signal:
+    token_id: str
+    outcome_name: str
+    event_name: str
+    side: str               # "BUY" or "SELL"
+    edge: float             # relative edge (0.0 - 1.0)
+    fair_value: float       # our computed probability
+    market_price: float     # best_ask (BUY) or best_bid (SELL)
+    size_usd: float         # bet size in USDC (from Kelly)
+    max_price: Optional[float] = None  # for BUY: max price willing to pay
+    min_price: Optional[float] = None  # for SELL: min price willing to accept
+    reason: str = "edge_detected"
+
+    def to_dict(self) -> dict:
+        return asdict(self)

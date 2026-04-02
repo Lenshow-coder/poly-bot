@@ -96,11 +96,11 @@ Phase 2 (scraper interface, NHL plugin, fair value computation, signal generatio
 
 Phase 2 adds three new subsystems on top of Phase 1's foundation:
 
-1. **Scraper layer** (`scrapers/`) — defines the data contract for sportsbook odds and provides a stub scraper for testing
-2. **Market plugin system** (`markets/`) — plugin interface + NHL Stanley Cup as the first concrete plugin
+1. **Scraper layer** (`scrapers/`) — defines the data contract for sportsbook odds, provides a CSV scraper for production (reads pre-normalized odds from an external scraper) and a stub scraper for testing
+2. **Market plugin system** (`markets/`) — plugin interface + NHL Stanley Cup as the first concrete plugin, with auto-discovery of outcomes from Polymarket
 3. **Signal engine** (`core/signal.py`) — compares fair values to Polymarket prices, computes Kelly bet sizes, emits trade signals
 
-By the end of Phase 2, running `main.py --dry-run` will: load the stub scraper → feed mock odds to the NHL plugin → compute fair values via vig removal → compare against live Polymarket prices → log signals with edge %, Kelly size, and trade direction. No orders placed.
+By the end of Phase 2, running `main.py --dry-run` will: load the CSV scraper → read normalized odds → feed them to the NHL plugin → compute fair values via vig removal → compare against live Polymarket prices → log signals with edge %, Kelly size, and trade direction. No orders placed.
 
 ## Files to Create/Modify
 
@@ -109,17 +109,18 @@ By the end of Phase 2, running `main.py --dry-run` will: load the stub scraper �
 | 1 | `scrapers/__init__.py` | Create | Package marker |
 | 2 | `scrapers/models.py` | Create | `BookOdds`, `EventOdds`, `ScrapedOdds` dataclasses |
 | 3 | `scrapers/base.py` | Create | `BaseScraper` abstract class |
-| 4 | `scrapers/stub_scraper.py` | Create | Returns hardcoded NHL odds for testing |
-| 5 | `markets/__init__.py` | Create | Package marker |
-| 6 | `markets/base.py` | Create | `MarketPlugin` abstract class, `OutcomeFairValue`, `TradeParams` |
-| 7 | `markets/nhl_stanley_cup/__init__.py` | Create | Package marker |
-| 8 | `markets/nhl_stanley_cup/plugin.py` | Create | `NHLStanleyCupPlugin` — implements `MarketPlugin` |
-| 9 | `markets/nhl_stanley_cup/fair_value.py` | Create | Vig removal, weighted aggregation across sportsbooks |
-| 10 | `markets/nhl_stanley_cup/config.yaml` | Create | Outcome name mappings, trade params, scraper event key |
-| 11 | `core/signal.py` | Create | `evaluate_signals()`, `kelly_bet_size()`, `check_exits()` |
-| 12 | `core/models.py` | Modify | Add `Signal` dataclass |
-| 13 | `config.yaml` | Modify | Add `risk`, `scrapers`, `enabled_markets`, `engine.dry_run` sections |
-| 14 | `main.py` | Modify | Add `--dry-run` flag, load scrapers + plugins, run signal pipeline |
+| 4 | `scrapers/csv_scraper.py` | Create | Reads normalized odds CSV, lowercases sportsbook names, produces `ScrapedOdds` |
+| 5 | `scrapers/stub_scraper.py` | Create | Returns hardcoded NHL odds for testing (canonical names, no name mapping) |
+| 6 | `markets/__init__.py` | Create | Package marker |
+| 7 | `markets/base.py` | Create | `MarketPlugin` abstract class, `OutcomeFairValue`, `TradeParams` (with layered defaults) |
+| 8 | `markets/nhl_stanley_cup/__init__.py` | Create | Package marker |
+| 9 | `markets/nhl_stanley_cup/plugin.py` | Create | `NHLStanleyCupPlugin` — auto-discovers outcomes from Polymarket, no name mapping needed |
+| 10 | `markets/nhl_stanley_cup/fair_value.py` | Create | Vig removal, weighted aggregation across sportsbooks |
+| 11 | `markets/nhl_stanley_cup/config.yaml` | Create | Event slug, scraper event key, trade param overrides only |
+| 12 | `core/signal.py` | Create | `evaluate_signals()`, `kelly_bet_size()`, `check_exits()` |
+| 13 | `core/models.py` | Modify | Add `Signal` dataclass |
+| 14 | `config.yaml` | Modify | Add `risk`, `trade_defaults`, `sportsbook_weight_defaults`, `scrapers`, `enabled_markets`, `engine.dry_run` |
+| 15 | `main.py` | Modify | Add `--dry-run` flag, load scrapers + plugins, run signal pipeline |
 | 15 | `tests/test_fair_value.py` | Create | Unit tests for vig removal and aggregation |
 | 16 | `tests/test_signal.py` | Create | Unit tests for edge calculation and Kelly sizing |
 
@@ -149,12 +150,12 @@ class ScrapedOdds:
 ```
 
 **Key design decisions:**
-- `BookOdds.sportsbook` must be **lowercase** (e.g., `"draftkings"`, not `"DraftKings"`). This string is used as a key in `sportsbook_keys` (plugin config) and `sportsbook_weights` (fair value config). A case mismatch silently splits a book into two groups — one with weight, one defaulting to 1.0. Scrapers must lowercase on construction; plugin configs must use lowercase throughout.
-- `decimal_odds` is always European decimal format. Scrapers convert from American/fractional before building `BookOdds`.
-- `outcomes` keys are the **sportsbook-native** names as they appear in the source. Different sportsbooks may use different names for the same team, which means the same team can appear under **multiple dict keys** (e.g., `"Toronto Maple Leafs"` from bet365 and `"TOR Maple Leafs"` from DraftKings). Each key holds `BookOdds` only from the sportsbook(s) that use that name. The plugin's `extract_odds()` maps all of these to canonical names via `sportsbook_keys`.
-- `events` keys are the human-readable event names that plugins match via their `scraper.event_key` config.
+- `BookOdds.sportsbook` must be **lowercase** (e.g., `"draftkings"`, not `"DraftKings"`). The CSV scraper lowercases on read. This string is used as a key in `sportsbook_weight_defaults` / `sportsbook_weights` config. A case mismatch silently falls back to weight 1.0.
+- `decimal_odds` is always European decimal format. The external scraper converts from American/fractional before writing to CSV.
+- `outcomes` keys are **canonical team names** matching Polymarket's outcome names (e.g., `"Toronto Maple Leafs"`). The external scraper normalizes sportsbook-native names before writing to CSV, so no name mapping is needed in the plugin.
+- `events` keys come from the CSV `market` column (e.g., `"Stanley Cup Winner"`). Plugins match via their `scraper.event_key` config.
 
-**Integration point:** Plugins receive `ScrapedOdds` from the engine and extract their slice using `scraper.event_key`.
+**Integration point:** Plugins receive `ScrapedOdds` from the engine and extract their slice using `scraper.event_key`. Since names are pre-normalized, the plugin just checks if a team exists on Polymarket — no name mapping needed.
 
 ### Step 2: Scraper Base Class (`scrapers/base.py`)
 
@@ -174,60 +175,30 @@ class BaseScraper(ABC):
 
 **Why async:** Phase 3's engine will run each scraper as an `asyncio.create_task` loop. Making the interface async now avoids a breaking change later. The stub scraper's `scrape()` simply returns immediately.
 
-### Step 3: Stub Scraper (`scrapers/stub_scraper.py`)
+### Step 3: CSV Scraper (`scrapers/csv_scraper.py`)
 
-Returns realistic but hardcoded odds for the NHL Stanley Cup. This lets us test the entire pipeline (plugin → fair value → signal) without needing a real scraper.
-
-The stub should include:
-- **6+ teams** with odds from **4+ sportsbooks** each
-- Odds that produce ~115-120% implied probability sum (realistic vig)
-- At least one outcome where the devigged fair value meaningfully diverges from what we'll see on Polymarket (to trigger a signal in testing)
-
-The snippet below shows 3 teams to illustrate the name-mapping pattern. The actual implementation **must** include all 6+ teams (matching the plugin config outcomes) — normalization and test behavior depend on a realistic outcome count. Shipping a 3-team stub will produce distorted fair values and misleading test results.
+Reads normalized odds from a CSV file produced by an external scraper. CSV columns: `timestamp, sport, sportsbook, market, team, odds`.
 
 ```python
-class StubScraper(BaseScraper):
+class CsvScraper(BaseScraper):
+    def __init__(self, name: str, interval: int, path: str):
+        super().__init__(name, interval)
+        self.path = path
+
     async def scrape(self) -> ScrapedOdds:
-        return ScrapedOdds(
-            timestamp=datetime.now(timezone.utc),
-            events={
-                "2026 NHL Stanley Cup Champion": EventOdds(
-                    event_name="2026 NHL Stanley Cup Champion",
-                    outcomes={
-                        # bet365/fanduel/betmgm use full names
-                        "Toronto Maple Leafs": [
-                            BookOdds("bet365", 4.50),
-                            BookOdds("fanduel", 4.55),
-                            BookOdds("betmgm", 4.35),
-                        ],
-                        # DraftKings uses abbreviated names — separate dict key
-                        "TOR Maple Leafs": [
-                            BookOdds("draftkings", 4.40),
-                        ],
-                        "Florida Panthers": [
-                            BookOdds("bet365", 6.00),
-                            BookOdds("fanduel", 6.20),
-                            BookOdds("betmgm", 5.90),
-                        ],
-                        "FLA Panthers": [
-                            BookOdds("draftkings", 5.80),
-                        ],
-                        "Edmonton Oilers": [
-                            BookOdds("bet365", 5.00),
-                            BookOdds("fanduel", 5.10),
-                            BookOdds("betmgm", 4.90),
-                        ],
-                        "EDM Oilers": [
-                            BookOdds("draftkings", 4.95),
-                        ],
-                        # ... more teams, same pattern
-                    }
-                )
-            }
-        )
+        # Read CSV, lowercase sportsbook names, group by market column
+        # Returns ScrapedOdds with events keyed by the "market" column value
 ```
 
-**Critical:** The stub uses **sportsbook-native names** as dict keys. "Toronto Maple Leafs" and "TOR Maple Leafs" are separate keys for the same team — the plugin's `sportsbook_keys` config maps both to the canonical name. This exercises the full name-mapping path. If the stub used canonical names for all books, the `(sportsbook, book_name)` lookup in `extract_odds()` would silently drop DraftKings odds because `("draftkings", "Toronto Maple Leafs")` wouldn't match `("draftkings", "TOR Maple Leafs")` in the name map.
+**Key details:**
+- Sportsbook names are **lowercased on read** to match `sportsbook_weight_defaults` keys in config
+- The `market` column value (e.g., `"Stanley Cup Winner"`) becomes the event key in `ScrapedOdds.events`
+- Team names are used as-is — the external scraper normalizes them to match Polymarket's canonical names
+- Odds are read as decimal format (the external scraper converts from American/fractional before writing)
+
+### Step 3b: Stub Scraper (`scrapers/stub_scraper.py`)
+
+Returns hardcoded odds for pipeline testing without needing a real CSV file. Uses canonical team names and lowercase sportsbook names (matching the CSV scraper's output format). The event key is `"Stanley Cup Winner"` to match the plugin config.
 
 ### Step 4: Market Plugin Interface (`markets/base.py`)
 
@@ -254,18 +225,24 @@ class TradeParams:
     price_range: tuple[float, float]  # only trade in this range
 
     @classmethod
-    def from_config(cls, cfg: dict) -> "TradeParams":
-        """Load from a plugin's config.yaml trade_params section."""
+    def from_config(cls, plugin_cfg: dict, defaults: dict | None = None) -> "TradeParams":
+        """Load from plugin config, falling back to global defaults for missing keys.
+
+        Args:
+            plugin_cfg: Plugin's trade_params section (overrides).
+            defaults: Global trade_defaults section from config.yaml (fallbacks).
+        """
+        merged = {**(defaults or {}), **plugin_cfg}
         return cls(
-            edge_threshold=cfg["edge_threshold"],
-            max_outcome_exposure=cfg["max_outcome_exposure"],
-            kelly_fraction=cfg["kelly_fraction"],
-            min_bet_size=cfg["min_bet_size"],
-            max_bet_size=cfg["max_bet_size"],
-            order_type=cfg.get("order_type", "FOK"),
-            min_sources=cfg.get("min_sources", 3),
-            cooldown_minutes=cfg.get("cooldown_minutes", 30),
-            price_range=tuple(cfg.get("price_range", [0.03, 0.95])),
+            edge_threshold=merged["edge_threshold"],
+            max_outcome_exposure=merged["max_outcome_exposure"],
+            kelly_fraction=merged["kelly_fraction"],
+            min_bet_size=merged["min_bet_size"],
+            max_bet_size=merged["max_bet_size"],
+            order_type=merged.get("order_type", "FOK"),
+            min_sources=merged.get("min_sources", 3),
+            cooldown_minutes=merged.get("cooldown_minutes", 30),
+            price_range=tuple(merged.get("price_range", [0.03, 0.95])),
         )
 
 class MarketPlugin(ABC):
@@ -285,7 +262,7 @@ class MarketPlugin(ABC):
     def get_trade_params(self) -> TradeParams: ...
 ```
 
-**`TradeParams.from_config()`** follows the convention from CLAUDE.md: defaults must be loadable via a `from_config()` classmethod. Here "config.yaml" means the **plugin's own** `markets/nhl_stanley_cup/config.yaml` `trade_params` section — not the repo-root `config.yaml`. Don't mirror plugin trade params into the root config.
+**`TradeParams.from_config()`** follows the convention from CLAUDE.md: defaults must be loadable via a `from_config()` classmethod. It takes two dicts: `plugin_cfg` (the plugin's `trade_params` section) and `defaults` (the global `trade_defaults` section from root `config.yaml`). The plugin dict is merged on top of the global defaults — plugin values win, missing keys fall back to global defaults. This means you can set your baseline strategy once in `config.yaml` and only override specific values per-plugin.
 
 ### Step 5: NHL Stanley Cup Plugin Config (`markets/nhl_stanley_cup/config.yaml`)
 
@@ -296,79 +273,32 @@ polymarket:
   event_slug: "2026-nhl-stanley-cup-champion"
   neg_risk: true
 
-# Canonical outcome names → sportsbook-specific keys
-# Token IDs are populated at startup by querying Gamma API with the event slug.
-# The plugin matches Gamma market.groupItemTitle to outcome.name to pair them.
-outcomes:
-  - name: "Toronto Maple Leafs"
-    sportsbook_keys:
-      bet365: "Toronto Maple Leafs"
-      draftkings: "TOR Maple Leafs"
-      fanduel: "Toronto Maple Leafs"
-      betmgm: "Toronto Maple Leafs"
-  - name: "Florida Panthers"
-    sportsbook_keys:
-      bet365: "Florida Panthers"
-      draftkings: "FLA Panthers"
-      fanduel: "Florida Panthers"
-      betmgm: "Florida Panthers"
-  - name: "Edmonton Oilers"
-    sportsbook_keys:
-      bet365: "Edmonton Oilers"
-      draftkings: "EDM Oilers"
-      fanduel: "Edmonton Oilers"
-      betmgm: "Edmonton Oilers"
-  - name: "Winnipeg Jets"
-    sportsbook_keys:
-      bet365: "Winnipeg Jets"
-      draftkings: "WPG Jets"
-      fanduel: "Winnipeg Jets"
-      betmgm: "Winnipeg Jets"
-  - name: "Dallas Stars"
-    sportsbook_keys:
-      bet365: "Dallas Stars"
-      draftkings: "DAL Stars"
-      fanduel: "Dallas Stars"
-      betmgm: "Dallas Stars"
-  - name: "Colorado Avalanche"
-    sportsbook_keys:
-      bet365: "Colorado Avalanche"
-      draftkings: "COL Avalanche"
-      fanduel: "Colorado Avalanche"
-      betmgm: "Colorado Avalanche"
-  # ... remaining teams added when real scraper data confirms naming conventions
+# Outcomes are auto-discovered from Polymarket at startup.
+# No need to list team names — the plugin queries the Gamma API for the event
+# and maps all outcomes to token IDs automatically.
 
+# Plugin-specific trade_params overrides. Keys here win over global
+# trade_defaults in config.yaml. Keys not listed inherit the global default.
 trade_params:
-  edge_threshold: 0.10
   max_outcome_exposure: 200
-  kelly_fraction: 0.25
-  min_bet_size: 5
-  max_bet_size: 50
-  order_type: "FOK"
-  min_sources: 3
-  cooldown_minutes: 30
-  price_range: [0.03, 0.95]
 
-# Sportsbook weights for fair value aggregation.
-# Higher weight = more influence. Sharp books (Bet365, Pinnacle) should be
-# weighted higher than soft books. Weights are relative — they get normalized.
-sportsbook_weights:
-  bet365: 2.0
-  draftkings: 1.0
-  fanduel: 1.0
-  betmgm: 1.0
+# Plugin-specific sportsbook weight overrides. Merged on top of global
+# sportsbook_weight_defaults. Only list books where this market's weighting
+# differs from the global baseline.
+# sportsbook_weights:
+#   pinnacle: 3.0  # example: if Pinnacle covered NHL futures
 
 scraper:
-  event_key: "2026 NHL Stanley Cup Champion"
+  event_key: "Stanley Cup Winner"
 ```
 
-**Token ID resolution strategy:** The plugin does NOT hardcode token IDs. At startup:
+**Auto-discovery strategy:** The plugin does NOT hardcode outcome names or token IDs. At startup:
 1. Plugin loads its `event_slug` from config
 2. Calls `PolymarketClient.get_event(slug)` to get `EventInfo` with all markets
-3. Matches each market's `outcome_name` (from `MarketInfo.outcome_name`, sourced from Gamma's `groupItemTitle`) to the plugin's `outcomes[].name`
-4. Stores the `yes_token_id` mapping: `{ "Toronto Maple Leafs": "abc123", ... }`
+3. Maps **every** market's `outcome_name` to its `yes_token_id`
+4. At scrape time, `extract_odds()` intersects CSV team names with the auto-discovered Polymarket outcomes — only teams that exist on both sides are processed
 
-This avoids hardcoding token IDs that could change if Polymarket re-deploys markets.
+This means adding a new team to Polymarket (or a sportsbook starting to cover a new team) requires zero config changes — the plugin picks it up automatically.
 
 ### Step 6: Fair Value Engine (`markets/nhl_stanley_cup/fair_value.py`)
 
@@ -457,7 +387,7 @@ class FairValueEngine:
 - If a sportsbook covers only a subset of outcomes, its vig removal is computed on the subset only. This produces a less accurate devig, so outcomes with fewer sources naturally get fewer `sources_agreeing` and may not meet `min_sources`.
 - If `sportsbook_weights` doesn't have a weight for a book, default to 1.0.
 - If the final fair values don't sum to 1.0 across all outcomes (they won't after per-book devigging and weighting), normalize them. This ensures the fair values are coherent probabilities.
-- **Known simplification:** Normalization runs over all outcomes in `mapped_odds`, but `compute_fair_values()` then drops outcomes that have no Polymarket token ID. This means the fair values logged for tradable outcomes may not sum to 1.0 (they sum to 1.0 minus the dropped outcomes' share). This is acceptable for Phase 2 — the edge calculation per outcome is still correct. If it causes confusion in logs, add a note like `"fair values sum to 0.94 (6% in untradable outcomes)"` in Phase 3.
+- **Known simplification:** Normalization runs over all outcomes in `mapped_odds`. With auto-discovery, all Polymarket outcomes have token IDs, so `compute_fair_values()` won't drop any. However, the sportsbook odds may cover teams not on Polymarket (or vice versa) — `extract_odds()` filters to the intersection, so fair values are normalized over the intersection set only.
 
 ### Step 7: NHL Stanley Cup Plugin (`markets/nhl_stanley_cup/plugin.py`)
 
@@ -467,37 +397,33 @@ Ties together config, fair value engine, and Polymarket token resolution.
 logger = logging.getLogger(__name__)
 
 class NHLStanleyCupPlugin(MarketPlugin):
-    def __init__(self, plugin_config: dict, client: PolymarketClient):
+    def __init__(self, plugin_config: dict, client: PolymarketClient, global_config: dict):
         self.config = plugin_config
         self.name = plugin_config["name"]
         self.event_key = plugin_config["scraper"]["event_key"]
-        self.trade_params = TradeParams.from_config(plugin_config["trade_params"])
-        self.fair_value_engine = FairValueEngine(
-            plugin_config.get("sportsbook_weights", {})
+
+        # Merge global defaults with plugin overrides
+        trade_defaults = global_config.get("trade_defaults", {})
+        self.trade_params = TradeParams.from_config(
+            plugin_config.get("trade_params", {}), defaults=trade_defaults
         )
 
-        # Build name mapping: { (sportsbook, sportsbook_name): canonical_name }
-        self.name_map = {}
-        for outcome in plugin_config["outcomes"]:
-            for book, book_name in outcome["sportsbook_keys"].items():
-                self.name_map[(book, book_name)] = outcome["name"]
+        # Sportsbook weights: global defaults + plugin overrides
+        weight_defaults = global_config.get("sportsbook_weight_defaults", {})
+        plugin_weights = plugin_config.get("sportsbook_weights", {})
+        merged_weights = {**weight_defaults, **plugin_weights}
+        self.fair_value_engine = FairValueEngine(merged_weights)
 
-        # Resolve token IDs from Polymarket at startup
-        self.token_map = {}  # { canonical_name: yes_token_id }
+        # Auto-discover all outcomes from Polymarket
+        self.token_map = {}  # { outcome_name: yes_token_id }
         self._resolve_tokens(client, plugin_config["polymarket"]["event_slug"])
 
     def _resolve_tokens(self, client, slug):
-        """Query Gamma API and map outcome names to token IDs."""
+        """Query Gamma API and map all outcome names to token IDs."""
         event = client.get_event(slug)
-        configured_names = {o["name"] for o in self.config["outcomes"]}
         for market in event.markets:
-            if market.outcome_name in configured_names:
-                self.token_map[market.outcome_name] = market.yes_token_id
-
-        # Log any configured outcomes that weren't found on Polymarket
-        missing = configured_names - set(self.token_map.keys())
-        if missing:
-            logger.warning(f"Outcomes not found on Polymarket: {missing}")
+            self.token_map[market.outcome_name] = market.yes_token_id
+        logger.info(f"Auto-discovered {len(self.token_map)} outcomes for {self.name}")
 
     def get_name(self) -> str:
         return self.name
@@ -510,23 +436,19 @@ class NHLStanleyCupPlugin(MarketPlugin):
 
     def extract_odds(self, scraped_odds: ScrapedOdds) -> dict[str, list[BookOdds]]:
         """
-        Filter ScrapedOdds to this plugin's event, map sportsbook names
-        to canonical outcome names.
+        Filter ScrapedOdds to this plugin's event, keeping only outcomes
+        that exist on Polymarket.
 
-        Returns: { canonical_name: [BookOdds, ...] }
+        Returns: { outcome_name: [BookOdds, ...] }
         """
         event_odds = scraped_odds.events.get(self.event_key)
         if not event_odds:
             return {}
 
         mapped = {}
-        for book_outcome_name, odds_list in event_odds.outcomes.items():
-            for odds in odds_list:
-                # Primary: look up (sportsbook, book_outcome_name) in the name map
-                canonical = self.name_map.get((odds.sportsbook, book_outcome_name))
-                if canonical is None:
-                    continue
-                mapped.setdefault(canonical, []).append(odds)
+        for team_name, odds_list in event_odds.outcomes.items():
+            if team_name in self.token_map:
+                mapped[team_name] = odds_list
 
         return mapped
 
@@ -547,11 +469,10 @@ class NHLStanleyCupPlugin(MarketPlugin):
         return results
 ```
 
-**Name mapping flow:**
-1. Scraper returns `EventOdds.outcomes` keyed by sportsbook-native names (e.g., `"TOR Maple Leafs"`)
-2. Each `BookOdds` carries the `sportsbook` field (e.g., `"draftkings"`)
-3. `extract_odds()` looks up `(sportsbook, book_name)` in `self.name_map` to get the canonical name
-4. Unmatched names are silently skipped (logged at DEBUG) — handles new teams or typos gracefully
+**Simplified flow (name normalization handled by external scraper):**
+1. CSV scraper reads pre-normalized odds with canonical team names and lowercased sportsbook names
+2. `extract_odds()` intersects CSV team names with auto-discovered Polymarket outcomes
+3. Teams not on Polymarket are silently skipped — no name mapping config needed
 
 ### Step 8: Signal Model (`core/models.py` modification)
 
@@ -707,13 +628,39 @@ risk:
   max_portfolio_exposure: 1000 # USD total across all events
   min_balance: 50              # pause new trades below this USDC balance
   min_bankroll: 200            # emergency pause below this total bankroll
-  # NOTE: per-outcome exposure lives in each plugin's trade_params.max_outcome_exposure,
+  # NOTE: per-outcome exposure lives in trade_defaults or per-plugin overrides,
   # NOT here. Don't duplicate it at the global level.
-  default_cooldown_minutes: 30
+
+# Global defaults for trade params. Every plugin inherits these unless it
+# overrides a specific key in its own trade_params section. This is the single
+# place to tune your baseline strategy across all markets.
+trade_defaults:
+  edge_threshold: 0.10
+  max_outcome_exposure: 300
+  kelly_fraction: 0.25
+  min_bet_size: 5
+  max_bet_size: 50
+  order_type: "FOK"
+  min_sources: 3
+  cooldown_minutes: 30
+  price_range: [0.03, 0.95]
+
+# Global defaults for sportsbook weights. Plugins inherit these and can
+# override individual book weights in their own sportsbook_weights section.
+# Higher weight = more influence on fair value. Sharp books should be higher.
+sportsbook_weight_defaults:
+  bet365: 2.0
+  draftkings: 1.0
+  fanduel: 1.0
+  betmgm: 1.0
+  betrivers: 1.0
+  caesars: 1.0
+  thescore: 1.0
 
 scrapers:
-  - name: stub
+  - name: csv
     interval: 60
+    path: "data/normalized_odds.csv"
 
 enabled_markets:
   - nhl_stanley_cup
@@ -721,20 +668,19 @@ enabled_markets:
 
 `engine.dry_run` is the config-file equivalent of `--dry-run`. The CLI flag overrides it (if either is true, dry-run is active).
 
-**Config authority — plugin vs. global (Fix 4):**
+**Config authority — layered defaults + plugin overrides:**
 
-Some parameters appear in both the global `config.yaml` (`risk.*`) and per-plugin `markets/nhl_stanley_cup/config.yaml` (`trade_params.*`). The rule for Phase 2:
+Trade params and sportsbook weights use a two-layer merge: global defaults in `config.yaml` → plugin overrides in `markets/<name>/config.yaml`. Plugin values win; missing keys inherit the global default. This means you set your baseline strategy once globally and only override per-market where needed.
 
-| Parameter | Authoritative source | Why |
-|---|---|---|
-| `kelly_bankroll` | Global `risk.kelly_bankroll` | Bankroll is account-wide, not per-market |
-| `max_outcome_exposure` | Plugin `trade_params.max_outcome_exposure` | Different markets may have different risk appetites |
-| `max_event_exposure` | Global `risk.max_event_exposure` | Cross-market budget enforcement |
-| `max_portfolio_exposure` | Global `risk.max_portfolio_exposure` | Cross-market budget enforcement |
-| `edge_threshold`, `kelly_fraction`, `min/max_bet_size`, `min_sources`, `cooldown_minutes`, `price_range` | Plugin `trade_params.*` | Market-specific tuning |
-| `min_balance`, `min_bankroll` | Global `risk.*` | Account-level safety checks |
+| Parameter | Where to set baseline | Where to override | Resolution |
+|---|---|---|---|
+| `edge_threshold`, `kelly_fraction`, `min/max_bet_size`, `min_sources`, `cooldown_minutes`, `price_range`, `max_outcome_exposure`, `order_type` | Global `trade_defaults.*` | Plugin `trade_params.*` | `{**trade_defaults, **plugin.trade_params}` |
+| Sportsbook weights | Global `sportsbook_weight_defaults.*` | Plugin `sportsbook_weights.*` | `{**global_weights, **plugin_weights}` |
+| `kelly_bankroll` | Global `risk.kelly_bankroll` | — | Account-wide, not per-market |
+| `max_event_exposure`, `max_portfolio_exposure` | Global `risk.*` | — | Cross-market budget (Phase 3) |
+| `min_balance`, `min_bankroll` | Global `risk.*` | — | Account-level safety (Phase 3) |
 
-In Phase 2 dry-run, only `kelly_bankroll` (global) and `trade_params.*` (plugin) are used. The global risk limits (`max_event_exposure`, `max_portfolio_exposure`, `min_balance`, `min_bankroll`) are Phase 3 risk manager parameters — they exist in config now for forward-compatibility but aren't read yet.
+In Phase 2 dry-run, only `kelly_bankroll` (global) and the merged `trade_params` are used. The global risk limits are Phase 3 risk manager parameters — they exist in config now for forward-compatibility but aren't read yet.
 
 ### Step 11: Main Entry Point Update (`main.py`)
 
@@ -762,16 +708,20 @@ def load_plugin_config(path: str) -> dict:
 
 
 KNOWN_PLUGINS = {"nhl_stanley_cup"}
-KNOWN_SCRAPERS = {"stub"}
+KNOWN_SCRAPERS = {"stub", "csv"}
 
 def load_plugins(config, client):
-    """Load enabled market plugins based on config."""
+    """Load enabled market plugins based on config.
+
+    Passes the global config so plugins can merge trade_defaults and
+    sportsbook_weight_defaults with their own overrides.
+    """
     plugins = []
     for market_name in config.get("enabled_markets", []):
         if market_name == "nhl_stanley_cup":
             from markets.nhl_stanley_cup.plugin import NHLStanleyCupPlugin
             plugin_config = load_plugin_config(f"markets/{market_name}/config.yaml")
-            plugins.append(NHLStanleyCupPlugin(plugin_config, client))
+            plugins.append(NHLStanleyCupPlugin(plugin_config, client, config))
         elif market_name not in KNOWN_PLUGINS:
             logger.warning(f"Unknown market plugin: '{market_name}' — skipping")
     return plugins
@@ -780,7 +730,14 @@ def load_scrapers(config):
     """Load enabled scrapers based on config."""
     scrapers = []
     for scraper_cfg in config.get("scrapers", []):
-        if scraper_cfg["name"] == "stub":
+        if scraper_cfg["name"] == "csv":
+            from scrapers.csv_scraper import CsvScraper
+            scrapers.append(CsvScraper(
+                name=scraper_cfg["name"],
+                interval=scraper_cfg["interval"],
+                path=scraper_cfg["path"],
+            ))
+        elif scraper_cfg["name"] == "stub":
             from scrapers.stub_scraper import StubScraper
             scrapers.append(StubScraper(
                 name=scraper_cfg["name"],

@@ -20,6 +20,47 @@ contracts:
 
 engine:
   default_order_type: "FOK"
+  dry_run: false
+
+risk:
+  kelly_bankroll: 500
+  max_event_exposure: 200
+  max_portfolio_exposure: 500
+  min_balance: 50
+  min_bankroll: 200
+
+# Global defaults for trade params. Every plugin inherits these unless it
+# overrides a specific key in its own trade_params section.
+trade_defaults:
+  edge_threshold: 0.10
+  max_outcome_exposure: 300
+  kelly_fraction: 0.25
+  min_bet_size: 5
+  max_bet_size: 50
+  order_type: "FOK"
+  min_sources: 3
+  cooldown_minutes: 30
+  price_range: [0.03, 0.95]
+
+# Global defaults for sportsbook weights. Plugins inherit these and can
+# override individual book weights in their own sportsbook_weights section.
+# Names must be lowercase (CSV scraper lowercases on read).
+sportsbook_weight_defaults:
+  bet365: 2.0
+  draftkings: 1.0
+  fanduel: 1.0
+  betmgm: 1.0
+  betrivers: 1.0
+  caesars: 1.0
+  thescore: 1.0
+
+scrapers:
+  - name: csv
+    interval: 60
+    path: "data/normalized_odds.csv"
+
+enabled_markets:
+  - nhl_stanley_cup
 
 logging:
   level: "INFO"

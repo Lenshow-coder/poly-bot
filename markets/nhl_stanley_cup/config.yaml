@@ -1,0 +1,23 @@
+name: "2026 NHL Stanley Cup Champion"
+
+polymarket:
+  event_slug: "2026-nhl-stanley-cup-champion"
+  neg_risk: true
+
+# Outcomes are auto-discovered from Polymarket at startup.
+# No need to list team names — the plugin queries the Gamma API for the event
+# and maps all outcomes to token IDs automatically.
+
+# Plugin-specific trade_params overrides. Keys here win over global
+# trade_defaults in config.yaml. Keys not listed inherit the global default.
+trade_params:
+  max_outcome_exposure: 200
+
+# Plugin-specific sportsbook weight overrides. Merged on top of global
+# sportsbook_weight_defaults. Only list books where this market's weighting
+# differs from the global baseline.
+# sportsbook_weights:
+#   pinnacle: 3.0  # example: if Pinnacle covered NHL futures
+
+scraper:
+  event_key: "Stanley Cup Winner"
