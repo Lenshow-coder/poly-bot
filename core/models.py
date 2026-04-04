@@ -90,3 +90,14 @@ class Signal:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+@dataclass
+class SportsbookSignal:
+    outcome_name: str
+    event_name: str
+    outlier_book: str
+    outlier_devigged_prob: float
+    consensus_prob: float
+    edge: float
+    direction: str              # "UNDER" or "OVER"

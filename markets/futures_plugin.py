@@ -2,13 +2,18 @@ import logging
 
 from core.polymarket_client import PolymarketClient
 from markets.base import MarketPlugin, OutcomeFairValue, TradeParams
-from markets.nhl_stanley_cup.fair_value import FairValueEngine
+from markets.fair_value import FairValueEngine
 from scrapers.models import BookOdds, ScrapedOdds
 
 logger = logging.getLogger(__name__)
 
 
-class NHLStanleyCupPlugin(MarketPlugin):
+class FuturesPlugin(MarketPlugin):
+    """Generic plugin for any futures market (sports championships, elections, etc.).
+
+    All market-specific behavior comes from the config dict — no subclassing needed.
+    """
+
     def __init__(self, plugin_config: dict, client: PolymarketClient, global_config: dict):
         self.config = plugin_config
         self.name = plugin_config["name"]
@@ -68,9 +73,9 @@ class NHLStanleyCupPlugin(MarketPlugin):
         return mapped
 
     def compute_fair_values(self, mapped_odds: dict) -> list[OutcomeFairValue]:
-        fair_probs = self.fair_value_engine.compute(mapped_odds)
+        fair_results = self.fair_value_engine.compute(mapped_odds)
         results = []
-        for name, prob in fair_probs.items():
+        for name, fvr in fair_results.items():
             token_id = self.token_map.get(name)
             if token_id is None:
                 continue
@@ -78,7 +83,10 @@ class NHLStanleyCupPlugin(MarketPlugin):
             results.append(OutcomeFairValue(
                 outcome_name=name,
                 token_id=token_id,
-                fair_value=prob,
+                fair_value=fvr.fair_value,
                 sources_agreeing=sources,
+                best_book_implied_prob=fvr.best_book_implied_prob,
+                best_book_name=fvr.best_book_name,
+                book_devigged=fvr.book_devigged,
             ))
         return results

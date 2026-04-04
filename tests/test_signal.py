@@ -70,6 +70,7 @@ def _make_trade_params(**overrides):
         min_sources=3,
         cooldown_minutes=30,
         price_range=(0.03, 0.95),
+        sportsbook_buffer=0.0,
     )
     defaults.update(overrides)
     return TradeParams(**defaults)
@@ -123,16 +124,28 @@ def test_signal_price_range_above():
 
 
 def test_signal_missing_price_data():
-    """best_ask or best_bid is None → outcome skipped."""
+    """Missing one side should still evaluate the available side."""
     fv = [OutcomeFairValue("Team A", "tok1", 0.25, 4)]
     prices = {"tok1": PriceInfo(best_bid=None, best_ask=0.18, midpoint=None)}
     tp = _make_trade_params()
     signals = evaluate_signals(fv, prices, tp, 1000, "Test Event")
-    assert len(signals) == 0
+    buy_signals = [s for s in signals if s.side == "BUY"]
+    assert len(buy_signals) == 1
 
     prices2 = {"tok1": PriceInfo(best_bid=0.17, best_ask=None, midpoint=None)}
     signals2 = evaluate_signals(fv, prices2, tp, 1000, "Test Event")
+    # No SELL edge here (bid < fair), and BUY side is unavailable
     assert len(signals2) == 0
+
+
+def test_signal_sell_with_missing_ask():
+    """SELL can be emitted when ask is missing but bid indicates clear edge."""
+    fv = [OutcomeFairValue("Team A", "tok1", 0.15, 4)]
+    prices = {"tok1": PriceInfo(best_bid=0.22, best_ask=None, midpoint=None)}
+    tp = _make_trade_params()
+    signals = evaluate_signals(fv, prices, tp, 1000, "Test Event")
+    sell_signals = [s for s in signals if s.side == "SELL"]
+    assert len(sell_signals) == 1
 
 
 def test_signal_missing_token():
@@ -153,3 +166,59 @@ def test_signal_sell():
     sell_signals = [s for s in signals if s.side == "SELL"]
     assert len(sell_signals) == 1
     assert sell_signals[0].edge > 0.10
+
+
+# --- sportsbook buffer tests ---
+
+def test_buffer_blocks_signal():
+    """Poly ask barely above best book implied prob → buffer blocks the signal.
+
+    best_book_implied_prob=0.17, poly_ask=0.18
+    relative gap = (0.18 - 0.17) / 0.17 ≈ 5.9%
+    With buffer=0.10 (10%), gap is too small → no signal.
+    """
+    fv = [OutcomeFairValue("Team A", "tok1", 0.25, 4,
+                           best_book_implied_prob=0.17, best_book_name="book1")]
+    prices = {"tok1": PriceInfo(best_bid=0.17, best_ask=0.18, midpoint=0.175)}
+    tp = _make_trade_params(sportsbook_buffer=0.10)
+    signals = evaluate_signals(fv, prices, tp, 1000, "Test Event")
+    buy_signals = [s for s in signals if s.side == "BUY"]
+    assert len(buy_signals) == 0
+
+
+def test_buffer_allows_signal():
+    """Poly ask well above best book implied prob → buffer passes.
+
+    best_book_implied_prob=0.10, poly_ask=0.18
+    relative gap = (0.18 - 0.10) / 0.10 = 80%
+    With buffer=0.05 (5%), gap is large enough → signal emitted.
+    """
+    fv = [OutcomeFairValue("Team A", "tok1", 0.25, 4,
+                           best_book_implied_prob=0.10, best_book_name="book1")]
+    prices = {"tok1": PriceInfo(best_bid=0.17, best_ask=0.18, midpoint=0.175)}
+    tp = _make_trade_params(sportsbook_buffer=0.05)
+    signals = evaluate_signals(fv, prices, tp, 1000, "Test Event")
+    buy_signals = [s for s in signals if s.side == "BUY"]
+    assert len(buy_signals) == 1
+
+
+def test_buffer_zero_disables():
+    """sportsbook_buffer=0.0 means no buffer check — original behavior."""
+    fv = [OutcomeFairValue("Team A", "tok1", 0.25, 4,
+                           best_book_implied_prob=0.17, best_book_name="book1")]
+    prices = {"tok1": PriceInfo(best_bid=0.17, best_ask=0.18, midpoint=0.175)}
+    tp = _make_trade_params(sportsbook_buffer=0.0)
+    signals = evaluate_signals(fv, prices, tp, 1000, "Test Event")
+    buy_signals = [s for s in signals if s.side == "BUY"]
+    assert len(buy_signals) == 1
+
+
+def test_buffer_no_best_book_data():
+    """best_book_implied_prob=0 (no data) → buffer check skipped, signal still emitted."""
+    fv = [OutcomeFairValue("Team A", "tok1", 0.25, 4,
+                           best_book_implied_prob=0.0, best_book_name="")]
+    prices = {"tok1": PriceInfo(best_bid=0.17, best_ask=0.18, midpoint=0.175)}
+    tp = _make_trade_params(sportsbook_buffer=0.10)
+    signals = evaluate_signals(fv, prices, tp, 1000, "Test Event")
+    buy_signals = [s for s in signals if s.side == "BUY"]
+    assert len(buy_signals) == 1

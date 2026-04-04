@@ -10,6 +10,9 @@ class OutcomeFairValue:
     token_id: str           # Polymarket YES token ID for this outcome
     fair_value: float       # devigged probability (0.0 - 1.0)
     sources_agreeing: int   # number of sportsbooks that contributed
+    best_book_implied_prob: float = 0.0   # lowest raw implied prob across books
+    best_book_name: str = ""              # which book offered the best price
+    book_devigged: dict[str, float] | None = None  # { sportsbook: devigged_prob }
 
 
 @dataclass
@@ -23,6 +26,7 @@ class TradeParams:
     min_sources: int                # minimum sportsbooks required
     cooldown_minutes: int           # wait time after trade on same outcome
     price_range: tuple[float, float]  # only trade in this range
+    sportsbook_buffer: float        # min gap between poly ask and best book implied prob
 
     @classmethod
     def from_config(cls, plugin_cfg: dict, defaults: dict | None = None) -> "TradeParams":
@@ -39,10 +43,11 @@ class TradeParams:
             kelly_fraction=merged["kelly_fraction"],
             min_bet_size=merged["min_bet_size"],
             max_bet_size=merged["max_bet_size"],
-            order_type=merged.get("order_type", "FOK"),
-            min_sources=merged.get("min_sources", 3),
-            cooldown_minutes=merged.get("cooldown_minutes", 30),
-            price_range=tuple(merged.get("price_range", [0.03, 0.95])),
+            order_type=merged["order_type"],
+            min_sources=merged["min_sources"],
+            cooldown_minutes=merged["cooldown_minutes"],
+            price_range=tuple(merged["price_range"]),
+            sportsbook_buffer=merged["sportsbook_buffer"],
         )
 
 

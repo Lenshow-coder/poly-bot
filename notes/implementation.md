@@ -900,30 +900,33 @@ Verify:
 - All Kelly sizing tests pass (edge cases, bounds)
 - All signal generation tests pass (threshold, filters)
 
-### 2. Stub Scraper → Fair Values (no Polymarket connection needed)
+### 2. CSV Scraper → Fair Values (no Polymarket connection needed)
 
 ```python
 # Quick check in a Python shell:
-from scrapers.stub_scraper import StubScraper
-from markets.nhl_stanley_cup.plugin import NHLStanleyCupPlugin
+from scrapers.csv_scraper import CsvScraper
+from markets.fair_value import FairValueEngine
 import asyncio, yaml
 
-stub = StubScraper("stub", 60)
-odds = asyncio.run(stub.scrape())
+csv_scraper = CsvScraper("csv", 60, "data/normalized_odds.csv")
+odds = asyncio.run(csv_scraper.scrape())
 
-# Load plugin config
-with open("markets/nhl_stanley_cup/config.yaml") as f:
-    pcfg = yaml.safe_load(f)
+# Load global config for sportsbook weights
+with open("config.yaml") as f:
+    cfg = yaml.safe_load(f)
 
-# Without Polymarket client — just test fair value math
-from markets.nhl_stanley_cup.fair_value import FairValueEngine
-engine = FairValueEngine(pcfg.get("sportsbook_weights", {}))
-# ... manually extract and pass odds to engine.compute()
+engine = FairValueEngine(cfg.get("sportsbook_weight_defaults", {}))
+# Extract odds for an event and pass to engine.compute()
+event_odds = list(odds.events.values())[0]
+result = engine.compute(event_odds.outcomes)
+print(result, "sum:", sum(result.values()))
 ```
 
 Verify: devigged fair values are sensible (sum ≈ 1.0, no negatives, no > 1.0).
 
-### 3. Full Dry Run (requires `.env` + Polymarket connection)
+Prerequisite: `data/normalized_odds.csv` must exist with columns: `timestamp, sport, sportsbook, market, team, odds`.
+
+### 3. Full Dry Run (requires `.env` + Polymarket connection + CSV file)
 
 ```
 .venv/Scripts/python.exe main.py --dry-run
@@ -932,7 +935,7 @@ Verify: devigged fair values are sensible (sum ≈ 1.0, no negatives, no > 1.0).
 Verify:
 - Client initializes, exchange balance printed
 - Plugin loads, token IDs resolved from Gamma API (log shows mapped outcomes)
-- Stub scraper returns odds
+- CSV scraper reads `data/normalized_odds.csv` without errors
 - Fair values computed and logged per outcome
 - Signals generated (or not) with edge %, Kelly size, direction
 - No orders placed
@@ -940,7 +943,7 @@ Verify:
 
 ### 4. Manual Spreadsheet Cross-Check
 
-Pick 2-3 outcomes from the stub scraper's odds. Manually compute:
+Pick 2-3 outcomes from the CSV odds file. Manually compute:
 1. Implied probs per sportsbook
 2. Devigged probs per sportsbook
 3. Weighted average across books
@@ -956,7 +959,35 @@ These are explicitly deferred to Phase 3:
 - **Risk manager** — no exposure/cooldown checks (signals are unfiltered except for source count and price range)
 - **Position tracker** — no position tracking or P&L computation
 - **Engine loop** — no continuous scraper scheduling; Phase 2 runs a single cycle
-- **Real scrapers** — stub only; real sportsbook scrapers are built independently
+- **Real-time scrapers** — CSV scraper reads pre-normalized odds from file; live sportsbook scrapers are built independently
 - **Telegram notifications** — no alerting
 - **CSV trade log** — no trades to log (but the signal log format previews what Phase 3's trade log will look like)
 - **WebSocket price feed** — Phase 2 uses REST `get_prices()` per token; Phase 3's engine will use the WebSocket cache for speed
+
+---
+
+## Post-Phase 2 Refactors
+
+### Generalized market plugin structure (2026-04-04)
+
+Per-market plugin folders (`markets/nhl_stanley_cup/`) replaced with a single generic `FuturesPlugin` class and flat config files:
+
+- `markets/futures_plugin.py` — shared plugin class, all behavior driven by config
+- `markets/fair_value.py` — shared devig + weighted averaging engine (was `nhl_stanley_cup/fair_value.py`)
+- `markets/configs/<market_name>.yaml` — one yaml per market, referenced by name in `enabled_markets`
+
+**Adding a new market** requires only a new yaml file in `markets/configs/`. No Python code needed. `main.py` auto-loads any market listed in `enabled_markets` by looking up `markets/configs/{name}.yaml`.
+
+### Plugin type dispatch (2026-04-04)
+
+Each market config has a `type` field (defaults to `futures`) that determines which plugin class handles it. `main.py` uses a `PLUGIN_TYPES` registry to map type strings to classes:
+
+```yaml
+# markets/configs/some_market.yaml
+type: futures    # → FuturesPlugin
+```
+
+To add a new category of market (e.g., polling-based elections):
+1. Create `markets/polling_plugin.py` implementing `MarketPlugin`
+2. Register it in `_register_plugin_types()` in `main.py`: `PLUGIN_TYPES["polling"] = PollingPlugin`
+3. Set `type: polling` in the market's config yaml

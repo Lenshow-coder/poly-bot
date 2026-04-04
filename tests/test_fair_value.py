@@ -1,30 +1,30 @@
 """Unit tests for FairValueEngine."""
+import math
 import pytest
 
-from markets.nhl_stanley_cup.fair_value import FairValueEngine
+from markets.fair_value import FairValueEngine, FairValueResult
 from scrapers.models import BookOdds
+
+
+def _fv_dict(result: dict[str, FairValueResult]) -> dict[str, float]:
+    """Extract just the fair_value floats for backward-compatible assertions."""
+    return {k: v.fair_value for k, v in result.items()}
 
 
 def test_basic_vig_removal_single_book():
     """3 outcomes from 1 sportsbook, implied probs sum to ~115%. Devigged should sum to 1.0."""
     engine = FairValueEngine({"bookA": 1.0})
     mapped = {
-        "Team A": [BookOdds("bookA", 2.50)],   # implied 0.400
-        "Team B": [BookOdds("bookA", 4.00)],   # implied 0.250
-        "Team C": [BookOdds("bookA", 3.33)],   # implied ~0.300 → sum ~0.950... let's use vig
-    }
-    # Use odds that produce clear vig: 1/2.50 + 1/4.00 + 1/2.85 ≈ 0.40 + 0.25 + 0.351 = 1.001
-    # Better: force a clean vig
-    mapped = {
         "Team A": [BookOdds("bookA", 2.00)],   # implied 0.500
         "Team B": [BookOdds("bookA", 3.00)],   # implied 0.333
         "Team C": [BookOdds("bookA", 3.00)],   # implied 0.333 → sum = 1.167
     }
     result = engine.compute(mapped)
-    assert abs(sum(result.values()) - 1.0) < 1e-9
+    fv = _fv_dict(result)
+    assert abs(sum(fv.values()) - 1.0) < 1e-9
     # Team A has highest implied prob → should have highest fair value
-    assert result["Team A"] > result["Team B"]
-    assert abs(result["Team B"] - result["Team C"]) < 1e-9
+    assert fv["Team A"] > fv["Team B"]
+    assert abs(fv["Team B"] - fv["Team C"]) < 1e-9
 
 
 def test_multi_book_aggregation():
@@ -48,18 +48,18 @@ def test_multi_book_aggregation():
         ],
     }
     result = engine.compute(mapped)
-    assert abs(sum(result.values()) - 1.0) < 1e-9
+    fv = _fv_dict(result)
+    assert abs(sum(fv.values()) - 1.0) < 1e-9
     # All books agree on ordering: A > B > C
-    assert result["Team A"] > result["Team B"] > result["Team C"]
+    assert fv["Team A"] > fv["Team B"] > fv["Team C"]
 
 
 def test_unequal_book_weights():
     """Sharp book (weight 2.0) vs soft books (weight 1.0). Fair values pulled toward sharp."""
-    # Sharp book gives Team A lower odds (higher prob) than soft books
     engine = FairValueEngine({"sharp": 2.0, "soft1": 1.0, "soft2": 1.0})
     mapped = {
         "Team A": [
-            BookOdds("sharp", 1.80),  # sharp thinks A is more likely
+            BookOdds("sharp", 1.80),
             BookOdds("soft1", 2.20),
             BookOdds("soft2", 2.20),
         ],
@@ -70,14 +70,14 @@ def test_unequal_book_weights():
         ],
     }
     result = engine.compute(mapped)
-    assert abs(sum(result.values()) - 1.0) < 1e-9
+    fv = _fv_dict(result)
+    assert abs(sum(fv.values()) - 1.0) < 1e-9
 
-    # Compare to equal-weight result
     equal_engine = FairValueEngine({"sharp": 1.0, "soft1": 1.0, "soft2": 1.0})
     equal_result = equal_engine.compute(mapped)
+    equal_fv = _fv_dict(equal_result)
 
-    # With sharp weighted 2x, Team A's fair value should be higher than equal weighting
-    assert result["Team A"] > equal_result["Team A"]
+    assert fv["Team A"] > equal_fv["Team A"]
 
 
 def test_partial_book_coverage():
@@ -101,17 +101,14 @@ def test_partial_book_coverage():
         ],
         "Team D": [
             BookOdds("bookA", 6.00),
-            # bookB missing
             BookOdds("bookC", 5.50),
         ],
     }
     result = engine.compute(mapped)
-    # All 4 outcomes should be present
-    assert len(result) == 4
-    # Should still sum to 1.0 after normalization
-    assert abs(sum(result.values()) - 1.0) < 1e-9
-    # All values should be positive and < 1
-    for v in result.values():
+    fv = _fv_dict(result)
+    assert len(fv) == 4
+    assert abs(sum(fv.values()) - 1.0) < 1e-9
+    for v in fv.values():
         assert 0 < v < 1
 
 
@@ -126,25 +123,83 @@ def test_normalization():
         "E": [BookOdds("b1", 12.00), BookOdds("b2", 13.00)],
     }
     result = engine.compute(mapped)
-    assert abs(sum(result.values()) - 1.0) < 1e-9
+    fv = _fv_dict(result)
+    assert abs(sum(fv.values()) - 1.0) < 1e-9
 
 
 def test_single_book():
     """Only 1 sportsbook provides odds. Vig removal alone should produce valid fair values."""
     engine = FairValueEngine({})
     mapped = {
-        "A": [BookOdds("solo", 2.50)],   # implied 0.400
-        "B": [BookOdds("solo", 3.50)],   # implied ~0.286
-        "C": [BookOdds("solo", 5.00)],   # implied 0.200 → sum = 0.886... need vig
-    }
-    # Use odds with vig (sum > 1.0)
-    mapped = {
         "A": [BookOdds("solo", 1.80)],   # 0.556
         "B": [BookOdds("solo", 3.00)],   # 0.333
         "C": [BookOdds("solo", 6.00)],   # 0.167 → sum = 1.056
     }
     result = engine.compute(mapped)
-    assert abs(sum(result.values()) - 1.0) < 1e-9
-    assert result["A"] > result["B"] > result["C"]
-    # Default weight 1.0 should be used for "solo"
-    assert len(result) == 3
+    fv = _fv_dict(result)
+    assert abs(sum(fv.values()) - 1.0) < 1e-9
+    assert fv["A"] > fv["B"] > fv["C"]
+    assert len(fv) == 3
+
+
+def test_best_book_tracking():
+    """FairValueResult should track the book with the lowest raw implied prob."""
+    engine = FairValueEngine({"book1": 1.0, "book2": 1.0})
+    mapped = {
+        "A": [
+            BookOdds("book1", 3.00),   # implied 0.333
+            BookOdds("book2", 4.00),   # implied 0.250 — best (lowest)
+        ],
+        "B": [
+            BookOdds("book1", 2.00),   # implied 0.500
+            BookOdds("book2", 1.80),   # implied 0.556
+        ],
+    }
+    result = engine.compute(mapped)
+    assert result["A"].best_book_name == "book2"
+    assert abs(result["A"].best_book_implied_prob - 0.25) < 1e-9
+    assert result["B"].best_book_name == "book1"
+    assert abs(result["B"].best_book_implied_prob - 0.50) < 1e-9
+
+
+def test_book_devigged_populated():
+    """FairValueResult should contain per-book devigged probs."""
+    engine = FairValueEngine({"b1": 1.0, "b2": 1.0})
+    mapped = {
+        "A": [BookOdds("b1", 2.00), BookOdds("b2", 2.10)],
+        "B": [BookOdds("b1", 3.00), BookOdds("b2", 2.90)],
+    }
+    result = engine.compute(mapped)
+    assert "b1" in result["A"].book_devigged
+    assert "b2" in result["A"].book_devigged
+    # Each book's devigged probs for A+B should sum to 1.0
+    for book in ["b1", "b2"]:
+        book_sum = result["A"].book_devigged[book] + result["B"].book_devigged[book]
+        assert abs(book_sum - 1.0) < 1e-9
+
+
+def test_invalid_book_odds_are_skipped():
+    """A book with invalid odds should be ignored, not crash the engine."""
+    engine = FairValueEngine({"good": 1.0, "bad": 1.0})
+    mapped = {
+        "A": [BookOdds("good", 2.00), BookOdds("bad", 0.0)],
+        "B": [BookOdds("good", 2.00), BookOdds("bad", 3.00)],
+    }
+    result = engine.compute(mapped)
+    fv = _fv_dict(result)
+    assert set(fv.keys()) == {"A", "B"}
+    assert abs(sum(fv.values()) - 1.0) < 1e-9
+    # With only "good" book contributing at equal odds, split should be equal.
+    assert abs(fv["A"] - 0.5) < 1e-9
+    assert abs(fv["B"] - 0.5) < 1e-9
+
+
+def test_all_invalid_odds_returns_empty():
+    """If every book is invalid, engine should return empty results."""
+    engine = FairValueEngine({"bad": 1.0})
+    mapped = {
+        "A": [BookOdds("bad", math.inf)],
+        "B": [BookOdds("bad", -2.0)],
+    }
+    result = engine.compute(mapped)
+    assert result == {}

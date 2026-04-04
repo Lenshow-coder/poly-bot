@@ -7,7 +7,7 @@ polymarket:
 
 polygon:
   rpc_urls:
-    - "https://polygon-mainnet.g.alchemy.com/v2/NdAQfmIpVmaNje7LN5mLn"
+    - "https://polygon-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}"
     - "https://polygon-rpc.com"
     - "https://rpc.ankr.com/polygon"
     - "https://polygon.llamarpc.com"
@@ -23,36 +23,43 @@ engine:
   dry_run: false
 
 risk:
-  kelly_bankroll: 500
-  max_event_exposure: 200
-  max_portfolio_exposure: 500
-  min_balance: 50
-  min_bankroll: 200
+  kelly_bankroll: 2000          # Total bankroll ($) used for Kelly criterion bet sizing
+  max_event_exposure: 200      # Max $ exposure allowed on any single event
+  max_portfolio_exposure: 500  # Max $ exposure across all open positions combined
+  min_balance: 50              # Minimum wallet balance ($) before bot stops placing new trades
+  min_bankroll: 200            # Minimum bankroll ($) threshold; below this, bot pauses trading
 
 # Global defaults for trade params. Every plugin inherits these unless it
 # overrides a specific key in its own trade_params section.
 trade_defaults:
-  edge_threshold: 0.10
-  max_outcome_exposure: 300
-  kelly_fraction: 0.25
-  min_bet_size: 5
-  max_bet_size: 50
-  order_type: "FOK"
-  min_sources: 3
-  cooldown_minutes: 30
-  price_range: [0.03, 0.95]
+  edge_threshold: 0.10         # Minimum edge (our fair price vs market price) required to place a trade
+  max_outcome_exposure: 200    # Max $ exposure on a single outcome (e.g. "Team X wins")
+  kelly_fraction: 0.25         # Fraction of full Kelly bet to use (0.25 = quarter-Kelly, more conservative)
+  min_bet_size: 5              # Minimum trade size ($); trades smaller than this are skipped
+  max_bet_size: 100            # Maximum trade size ($) regardless of Kelly recommendation
+  order_type: "FAK"            # Default order type: FAK (Fill-And-Kill) or FOK (Fill-Or-Kill)
+  min_sources: 2               # Minimum number of sportsbook sources required before trusting a consensus line
+  cooldown_minutes: 30         # Minutes to wait after trading an outcome before trading it again
+  price_range: [0.01, 0.66]   # Only trade markets with prices in this range (avoid extremes near 0 or 1)
+  sportsbook_buffer: 0.05     # Min relative gap between poly ask and best raw sportsbook implied prob
 
 # Global defaults for sportsbook weights. Plugins inherit these and can
 # override individual book weights in their own sportsbook_weights section.
 # Names must be lowercase (CSV scraper lowercases on read).
 sportsbook_weight_defaults:
-  bet365: 2.0
   draftkings: 1.0
-  fanduel: 1.0
+  fanduel: 2.0
   betmgm: 1.0
   betrivers: 1.0
+  bet365: 1.0
   caesars: 1.0
   thescore: 1.0
+
+sportsbook_signals:
+  enabled: true
+  edge_threshold: 0.1         # Min relative deviation from consensus to flag a book as outlier
+  abs_edge_threshold: 0.01   # Min absolute probability difference from consensus to flag
+  min_sources: 3               # Skip outcomes with fewer contributing books
 
 scrapers:
   - name: csv

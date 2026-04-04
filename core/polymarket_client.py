@@ -108,9 +108,12 @@ class PolymarketClient:
 
     def get_order_book(self, token_id: str) -> dict:
         book = self.clob.get_order_book(token_id)
-        # Asks come DESCENDING from the API — reverse them to ascending
+        # Asks come DESCENDING from the API — reverse to ascending (best ask first)
         if hasattr(book, "asks") and book.asks:
             book.asks = list(reversed(book.asks))
+        # Bids come ASCENDING from the API — reverse to descending (best bid first)
+        if hasattr(book, "bids") and book.bids:
+            book.bids = list(reversed(book.bids))
         return book
 
     def get_prices(self, token_id: str) -> PriceInfo:
