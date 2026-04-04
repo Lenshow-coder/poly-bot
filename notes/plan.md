@@ -85,128 +85,138 @@ The architecture is **market-plugin based**: a core engine handles Polymarket in
 │  │  Polymarket  │  │  Position    │  │    State Manager         │  │
 │  │  Client      │  │  Tracker     │  │                          │  │
 │  │              │  │              │  │ Persist state across     │  │
-│  │ API + WS     │  │ Positions,   │  │ restarts (JSON files)    │  │
-│  │ connections  │  │ P&L, fills   │  │                          │  │
+│  │ API (+WS*)   │  │ Positions,   │  │ restarts (JSON files)    │  │
+│  │              │  │ P&L, fills   │  │                          │  │
 │  └──────────────┘  └──────────────┘  └──────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
+\* **WebSocket in the Polymarket client:** target architecture (Phase 3+). As of Phase 2 complete, prices for signal generation come from the **CLOB REST order book** (`get_prices` per token). Market WebSocket is verified separately via `test_connection.py --ws-test`.
+
 ### Flow
 
-1. **Each scraper runs as an independent async task** on its own interval (e.g., scraper A every 30s, scraper B every 5 minutes). Scrapers are fully decoupled from each other.
+1. **Each scraper runs as an independent async task** on its own interval (e.g., scraper A every 30s, scraper B every 5 minutes). Scrapers are fully decoupled from each other. *(Phase 2 today: `main.py --dry-run` runs a **single pass** over scrapers; per-scraper `interval` is configured but **not yet** used to schedule repeating loops — that belongs in `core/engine.py` in Phase 3.)*
 2. **When any scraper completes**, its `ScrapedOdds` is immediately processed — no waiting, no coordination with other scrapers.
-3. **Each plugin** whose `event_key` appears in the scraper's results extracts its odds, maps names, and computes fair values
-4. **The signal engine** compares each fair value to the current Polymarket price (from WebSocket or API)
-5. When `|fair_value - market_price|` exceeds the edge threshold (fees + buffer), a **trade signal** is emitted
-6. **Risk manager** gates the signal: checks position limits, portfolio exposure, cooldowns, balance thresholds
-7. **Executor** places the order on Polymarket via the CLOB API and tracks its lifecycle
+3. **Each plugin** whose scraper event key appears in the scraper's results extracts its odds (outcome names aligned with Polymarket/Gamma) and computes fair values.
+4. **The signal engine** compares each fair value to the current Polymarket price. **Phase 2:** best bid/ask from **CLOB REST** per token. **Later:** optional WebSocket-backed cache in the client/engine for lower latency.
+5. When relative edge (and filters like `sportsbook_buffer`, `price_range`, `min_sources`) pass, a **trade signal** is emitted (BUY and/or SELL — see `core/signal.py`).
+6. **Risk manager** gates the signal: checks position limits, portfolio exposure, cooldowns, balance thresholds *(Phase 3 — not wired yet; `config.yaml` already defines `risk` and `trade_defaults` for enforcement).*
+7. **Executor** places the order on Polymarket via the CLOB API and tracks its lifecycle *(Phase 3 — `PolymarketClient.place_order` exists; dedicated executor module still to add).*
 
-Scrapers are completely independent — each runs on its own schedule, and the latency from any individual scraper completing to a trade being placed is **under 1 second**.
+Scrapers are completely independent — each runs on its own schedule, and the latency from any individual scraper completing through signal generation is **under ~1 second** (REST order book fetches dominate). Full **scraper interval loops + live execution** are Phase 3.
 
 ---
 
 ## 2. Project Structure
 
+**As implemented through Phase 2** (Phase 3 adds the commented “planned” files):
+
 ```
 poly-bot/
-├── main.py                      # Entry point: starts core engine + all enabled plugins (supports --dry-run flag)
-├── config.yaml                  # Global configuration (credentials, risk params, enabled markets)
+├── main.py                      # Entry: PolymarketClient, load plugins/scrapers; --dry-run runs one pipeline pass; live mode = Phase 3
+├── config.yaml                  # Global configuration (Polymarket, polygon, contracts, engine, risk, trade_defaults, scrapers, enabled_markets, …)
+├── pyproject.toml               # Dependencies (managed with uv); no requirements.txt
+├── uv.lock                      # Lockfile
+├── test_connection.py           # Integration checks (Gamma, CLOB, balances, optional --ws-test, order smoke tests)
 │
-├── core/                        # Core engine (market-agnostic)
+├── core/
 │   ├── __init__.py
-│   ├── engine.py                # Main loop: orchestrates plugins, signals, execution
-│   ├── polymarket_client.py     # Polymarket API client (CLOB + Gamma + WebSocket)
-│   ├── executor.py              # Order placement, cancellation, fill tracking
-│   ├── signal.py                # Signal data class + signal evaluation logic
-│   ├── risk_manager.py          # Position limits, exposure checks, cooldowns
-│   ├── position_tracker.py      # Track positions, average cost, P&L per market
-│   ├── state.py                 # Persist/load bot state to/from disk (JSON)
-│   ├── models.py                # Data classes: Signal, Position, Order, MarketInfo, etc.
-│   ├── notifier.py              # Telegram alert notifications
-│   └── utils.py                 # Shared helpers (logging setup, retry logic, etc.)
+│   ├── polymarket_client.py     # CLOB + Gamma + data API (positions); Web3 balances/approvals; REST order book → PriceInfo; place_order (sync)
+│   ├── signal.py                # evaluate_signals(), kelly_bet_size(), check_exits(); BUY/SELL signal emission
+│   ├── sportsbook_signal.py     # Optional: flag outlier books vs consensus (diagnostics; config sportsbook_signals)
+│   ├── state.py                 # StateManager — JSON persistence
+│   ├── models.py                # PriceInfo, MarketInfo, EventInfo, OrderResult, Position, BankrollSnapshot, Signal, SportsbookSignal
+│   └── utils.py                 # Logging, load_config, env credentials, data dir
+│   # Planned Phase 3:
+│   # ├── engine.py
+│   # ├── executor.py
+│   # ├── risk_manager.py
+│   # ├── position_tracker.py
+│   # └── notifier.py
 │
-├── scrapers/                    # Odds scrapers (each can cover one or many events)
+├── scrapers/
 │   ├── __init__.py
-│   ├── base.py                  # Abstract scraper interface (BaseScraper)
-│   ├── models.py                # ScrapedOdds, EventOdds, BookOdds data classes
-│   ├── odds_aggregator.py       # Example: scrapes an aggregator site covering NHL, NBA, etc.
+│   ├── base.py                  # BaseScraper(name, interval); async scrape()
+│   ├── models.py                # ScrapedOdds, EventOdds, BookOdds
+│   └── csv_scraper.py           # Production path: reads normalized odds CSV → ScrapedOdds
 │
-├── markets/                     # Market plugins (one subpackage per event)
+├── markets/
 │   ├── __init__.py
-│   ├── base.py                  # Abstract base class: MarketPlugin interface
-│   ├── nhl_stanley_cup/         # Example: first event to implement
-│   │   ├── __init__.py
-│   │   ├── plugin.py            # Implements MarketPlugin — filters ScrapedOdds, maps names
-│   │   ├── fair_value.py        # Vig removal, aggregation, sharp-book weighting
-│   │   └── config.yaml          # Event-specific params (outcome mappings, token IDs, thresholds)
+│   ├── base.py                  # MarketPlugin, OutcomeFairValue, TradeParams
+│   ├── fair_value.py            # FairValueEngine — vig removal, weighted aggregation (shared across futures markets)
+│   ├── futures_plugin.py        # FuturesPlugin — config-driven; Gamma auto-discovery of outcomes → token IDs
+│   └── configs/                 # One YAML per enabled market (filename = key in enabled_markets)
+│       └── nhl_stanley_cup.yaml # Example: type futures, polymarket slug, scraper event_key, trade_params overrides
 │
-├── data/                        # Runtime data (gitignored)
-│   ├── state.json               # Persisted bot state (positions, cooldowns)
-│   ├── trades.csv               # CSV trade summary log
-│   └── logs/                    # Log files
+├── data/                        # Runtime (gitignored)
+│   ├── state.json
+│   ├── normalized_odds.csv      # Input to csv scraper (example path; configurable)
+│   └── logs/
 │
-├── tests/                       # Test suite
-│   ├── test_fair_value.py       # Unit tests for vig removal, aggregation
-│   ├── test_signal.py           # Unit tests for signal generation
-│   ├── test_risk_manager.py     # Unit tests for risk gates
-│   └── test_executor.py         # Unit tests for order logic
+├── tests/
+│   ├── test_fair_value.py
+│   ├── test_signal.py
+│   └── test_sportsbook_signal.py
+│   # Planned: test_risk_manager.py, test_executor.py, …
 │
-├── .env                         # Secrets (PK, BROWSER_ADDRESS, TELEGRAM_*) — gitignored
-├── .env.example                 # Template for .env
-├── requirements.txt             # Python dependencies
-└── README.md                    # Setup and usage instructions
+├── .env                         # Secrets — gitignored (see .env.example)
+└── .env.example                 # PK, BROWSER_ADDRESS (Telegram vars when notifier lands)
 ```
 
 ---
 
 ## 3. Core Engine
 
-### 3.1 `engine.py` — Main Orchestrator
+### 3.1 `engine.py` — Main Orchestrator *(Phase 3 — not present yet)*
 
-The engine runs a single async event loop that:
+**Target behavior:** the engine runs a single async event loop that:
 
 1. **Initializes** the Polymarket client (authenticates, derives API keys)
 2. **Loads enabled scrapers and market plugins** from config
-3. **Starts WebSocket connections** for real-time Polymarket prices
-4. **Launches each scraper as an independent async task**, each running on its own interval. When a scraper completes:
+3. **Optionally starts WebSocket connections** for a local order book cache (recommended Phase 3+; see §5.2)
+4. **Launches each scraper as an independent async task**, each running on its own `interval`. When a scraper completes:
   - Its `ScrapedOdds` is passed to relevant plugins → `extract_odds()` → `compute_fair_values()`
   - Signal engine compares fair values to Polymarket prices
   - Signals pass through `risk_manager.approve()` → approved signals go to `executor.execute()`
-5. **Runs a background task** that periodically syncs positions and USDC balance from the API (every 60s) as a ground-truth check against local tracking
+5. **Runs a background task** that periodically syncs positions and balance from the API as a ground-truth check against local tracking
+
+**Phase 2 stand-in:** `main.py` defines `dry_run_cycle()` which, for each scraper, awaits one `scrape()`, then runs plugins → `evaluate_signals()` → logs. There is **no** infinite `scraper_loop` yet and **no** `risk_manager` / `executor` calls.
 
 ```python
-# Pseudocode
+# Target pseudocode (Phase 3)
 async def run():
     client = PolymarketClient(config)
-    scrapers = load_scrapers(config.enabled_scrapers)
-    plugins = load_plugins(config.enabled_markets)
+    scrapers = load_scrapers(config)
+    plugins = load_plugins(config, client)
     risk_mgr = RiskManager(config.risk)
     executor = Executor(client)
     position_tracker = PositionTracker(client)
 
-    # Start WebSocket for live Polymarket prices
-    asyncio.create_task(client.connect_market_ws(all_token_ids(plugins)))
+    # Optional Phase 3+: asyncio.create_task(client.connect_market_ws(...))
     async def process_scraper_result(scraped_odds: ScrapedOdds):
-        """Called whenever a scraper completes — processes immediately."""
         for plugin in plugins:
             if plugin.event_key not in scraped_odds.events:
-                continue  # this scraper doesn't cover this plugin's event
+                continue
 
-            event_odds = plugin.extract_odds(scraped_odds)
-            fair_values = plugin.compute_fair_values(event_odds)
-            polymarket_prices = client.get_prices(plugin.token_ids)
+            mapped_odds = plugin.extract_odds(scraped_odds)
+            if not mapped_odds:
+                continue
+            fair_values = plugin.compute_fair_values(mapped_odds)
+            prices = {tid: client.get_prices(tid) for tid in plugin.get_token_ids()}
 
-            signals = evaluate_signals(fair_values, polymarket_prices, plugin.config)
-
+            signals = evaluate_signals(
+                fair_values, prices, plugin.get_trade_params(),
+                kelly_bankroll=config["risk"]["kelly_bankroll"],
+                event_name=plugin.get_name(),
+            )
             for signal in signals:
                 if risk_mgr.approve(signal, position_tracker):
-                    if not config.dry_run:
+                    if not config["engine"].get("dry_run"):
                         await executor.execute(signal)
                     else:
                         logger.info(f"[DRY RUN] Would execute: {signal}")
 
     async def scraper_loop(scraper: BaseScraper):
-        """Each scraper runs independently on its own interval."""
         while True:
             try:
                 scraped_odds = await scraper.scrape()
@@ -215,81 +225,78 @@ async def run():
                 logger.error(f"Scraper {scraper.get_name()} failed: {e}")
             await asyncio.sleep(scraper.interval)
 
-    # Start each scraper as an independent async task
     for scraper in scrapers:
         asyncio.create_task(scraper_loop(scraper))
+    await asyncio.Event().wait()  # run until shutdown
 ```
 
 ### 3.1.1 Dry-Run Mode
 
-The bot supports a `--dry-run` flag that runs the full pipeline (fetch odds, compute fair values, generate signals, check risk gates) but **stops before placing any orders**. In dry-run mode:
+The bot supports `--dry-run` and `engine.dry_run` in `config.yaml`. **Phase 2 behavior** (`main.py`):
 
-- All signals are logged with full detail (edge, Kelly size, fair value, market price)
-- Risk manager approvals/rejections are logged
-- No orders are placed — the executor logs what *would* have been executed
-- Position tracker is not updated (no phantom positions)
-- CSV trade log is still written (for offline analysis of signal quality)
+- Runs **one pass** per invocation: each enabled scraper is scraped once, then each plugin processes results.
+- Logs fair values (with best bid/ask from REST), optional sportsbook outlier lines (`sportsbook_signals`), and any **BUY** / **SELL** signals with edge and Kelly size.
+- **No orders** are placed; live mode prints *“Live mode not yet implemented (Phase 3)”* and exits.
 
-This is essential for validating the model and tuning thresholds before risking real money.
+**Phase 3 extensions** (when engine + risk + executor exist):
+
+- Risk manager approvals/rejections logged per signal
+- Executor logs what would run (or runs for live)
+- CSV trade log for executions and/or signal audit trail
+- Position tracker updates only on real fills
 
 ```python
-# In engine.py
-if not config.dry_run:
+# Target (Phase 3 engine)
+if not config["engine"].get("dry_run"):
     await executor.execute(signal)
 else:
     logger.info(f"[DRY RUN] Would execute: {signal}")
 ```
 
-### 3.2 `polymarket_client.py` — API & WebSocket Client
+### 3.2 `polymarket_client.py` — API client *(WebSocket: Phase 3 / hardening)*
 
-**Keep from market-maker bot:**
+**Implemented today (Phase 1–2):**
 
-- Authentication flow (PK + BROWSER_ADDRESS → ClobClient with signature_type=2)
-- API key derivation
-- WebSocket connection management (Market WS) with auto-reconnect
-- On-chain contract approvals (`approveContracts()`)
-- Position/balance queries
+- Authentication: `PK`, `BROWSER_ADDRESS` from env; `ClobClient` with `signature_type` and `chain_id` from `config.yaml`
+- Gamma: `get_event(slug)` → `EventInfo` / `MarketInfo` with YES/NO token IDs
+- CLOB: `get_order_book`, `get_prices(token_id)` → `PriceInfo` (best bid/ask from REST; asks/bids sorted for correct best)
+- Balances: `get_usdc_balance()` (wallet), `get_exchange_balance()` (collateral on exchange)
+- Orders: synchronous `place_order(..., order_type="FOK"|"FAK")` → `OrderResult`
+- On-chain: `approve_contracts()` for USDC + CTF approvals (exchange / neg-risk / CTF addresses from `config.yaml`)
+- Data API: `get_positions()` (raw list from `polymarket.data_url`)
 
-**Adapt:**
+**Not in the client yet:** `connect_market_ws`, local `SortedDict` book cache, `cancel_order` wrapper. WebSocket smoke test lives in **`test_connection.py --ws-test`** only.
 
-- Order placement: the market-maker always posts limit orders at computed prices. For market-taking, we need to support:
-  - **FOK (Fill-or-Kill)**: attempt to fill entire order immediately or cancel — best for larger orders where partial fills aren't useful
-  - **FAK (Fill-and-Kill)**: fill what's available immediately, cancel the rest — good for grabbing available liquidity
-  - **GTC with aggressive price**: post a limit order at/above the best ask (to buy) or at/below the best bid (to sell) — functionally a market order that fills immediately if liquidity exists
+**Adapt (market-taking vs maker):**
 
-**Key methods:**
+- **FOK** / **FAK** via `py-clob-client` `OrderType` (default order type also in `trade_defaults.order_type` in config)
+- **GTC** is discouraged for taking (see §14); aggressive limit at touch is still a limit order, not a standing quote
+
+**Key methods (conceptual):**
 
 ```python
 class PolymarketClient:
-    def __init__(self, pk, browser_address, ...):
-        # Initialize ClobClient, Web3, contract interfaces
+    def __init__(self, config: dict):
+        # ClobClient, Web3 RPC fallback, gamma_url, data_url
 
-    async def connect_market_ws(self, token_ids: list[str]):
-        # Subscribe to order book updates for monitored tokens
+    # Phase 3+: async def connect_market_ws(self, token_ids: list[str]): ...
 
-    def get_prices(self, token_ids: list[str]) -> dict[str, PriceInfo]:
-        # Return best bid, best ask, midpoint from local order book cache
+    def get_prices(self, token_id: str) -> PriceInfo:
+        # Today: REST order book. Future: optional cache fed by WS.
 
-    def get_book_depth(self, token_id: str, side: str, levels: int) -> list[PriceLevel]:
-        # Walk the order book to find available liquidity at each price level
+    def place_order(
+        self, token_id, side, size, price, order_type: str = "FOK"
+    ) -> OrderResult:
+        # Synchronous post to CLOB
 
-    async def place_order(self, token_id, side, size, price, order_type="FOK") -> OrderResult:
-        # Place an order via CLOB API
-
-    async def cancel_order(self, order_id: str) -> bool:
-        # Cancel an open order
-
-    def get_usdc_balance(self) -> float:
-        # Query USDC ERC-20 balanceOf(wallet) on Polygon via web3
-        # Returns balance in USD (raw / 1e6)
-
-    def get_positions(self) -> dict[str, Position]:
-        # Fetch current positions from data API
+    def get_usdc_balance(self) -> float: ...
+    def get_exchange_balance(self) -> float: ...
+    def get_positions(self) -> list[dict]: ...
 ```
 
-### 3.3 `executor.py` — Order Execution
+### 3.3 `executor.py` — Order Execution *(Phase 3 — not present yet)*
 
-Responsible for translating a trade signal into an actual order and tracking the result.
+Responsible for translating a trade signal into an actual order and tracking the result. **`PolymarketClient.place_order`** is synchronous today; the executor can call it directly or wrap it in `asyncio.to_thread` if the engine stays async-first.
 
 ```python
 class Executor:
@@ -337,12 +344,17 @@ Unlike the market-maker which posts passive limit orders and waits, a market-tak
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
+from scrapers.models import BookOdds, ScrapedOdds
+
 @dataclass
 class OutcomeFairValue:
     outcome_name: str       # e.g., "Toronto Maple Leafs"
-    token_id: str           # Polymarket token ID for YES on this outcome
-    fair_value: float       # Computed fair probability (0.0 - 1.0)
-    sources_agreeing: int   # How many sportsbooks contributed to this estimate
+    token_id: str           # Polymarket YES token ID for this outcome
+    fair_value: float       # Devigged probability (0.0 - 1.0)
+    sources_agreeing: int   # Count of contributing sportsbooks
+    best_book_implied_prob: float  # raw implied prob from best decimal odds
+    best_book_name: str
+    book_devigged: dict[str, float] | None  # per-book devigged probs (for outlier diagnostics)
 
 class MarketPlugin(ABC):
     """
@@ -359,11 +371,11 @@ class MarketPlugin(ABC):
         """All Polymarket token IDs this plugin monitors"""
 
     @abstractmethod
-    def extract_odds(self, scraped_odds: ScrapedOdds) -> dict:
+    def extract_odds(self, scraped_odds: ScrapedOdds) -> dict[str, list[BookOdds]]:
         """
-        Filter the full ScrapedOdds to this plugin's event and map outcome names
-        using the sportsbook_keys config. Returns the standardized internal format:
-        { outcome_name: [(sportsbook, decimal_odds), ...] }
+        Filter ScrapedOdds to this plugin's event (via config scraper.event_key).
+        Outcome keys must match Polymarket/Gamma outcome names for futures plugins.
+        Returns: { outcome_name: [BookOdds, ...] }
         """
 
     @abstractmethod
@@ -376,62 +388,38 @@ class MarketPlugin(ABC):
     @abstractmethod
     def get_trade_params(self) -> TradeParams:
         """
-        Return event-specific trading parameters:
-        - edge_threshold: minimum relative edge required to trade (e.g., 0.10 = 10%)
-        - max_outcome_exposure: max USDC exposure per outcome
-        - kelly_fraction: fraction of full Kelly to use (e.g., 0.25 for quarter-Kelly)
-        - order_type: FOK or FAK
-        - min_sources: minimum sportsbooks required to generate a signal
-        - neg_risk: whether this is a neg-risk event
-        - tick_size: minimum price increment
+        Merged global trade_defaults + plugin overrides — see markets/base.TradeParams:
+        edge_threshold, max_outcome_exposure, kelly_fraction, min_bet_size, max_bet_size,
+        order_type (FOK/FAK), min_sources, cooldown_minutes, price_range, sportsbook_buffer.
         """
 ```
 
-### 4.2 Example Plugin: `markets/nhl_stanley_cup/`
+### 4.2 Example: NHL Stanley Cup (`FuturesPlugin` + `markets/configs/nhl_stanley_cup.yaml`)
 
-`**config.yaml**`
+First production market uses the generic **`FuturesPlugin`** (`markets/futures_plugin.py`): no per-event Python package. Outcomes and YES token IDs are **auto-discovered** from Gamma at startup using `polymarket.event_slug`. The CSV / scraper must use **outcome names that match Polymarket’s `groupItemTitle`** for each team so `extract_odds()` can align books to tokens.
+
+**`markets/configs/nhl_stanley_cup.yaml`** (illustrative; see repo for exact file):
 
 ```yaml
 name: "2026 NHL Stanley Cup Champion"
-polymarket:
-  event_slug: "2026-nhl-stanley-cup-champion"  # verify exact slug via Gamma API
-  neg_risk: true
-  # Token IDs populated at startup by querying the Gamma API with the slug
-  # This avoids hardcoding IDs that could change
+type: futures
 
-outcomes:
-  # Maps team names to their sportsbook identifiers across books
-  - name: "Toronto Maple Leafs"
-    sportsbook_keys:
-      betano: "Toronto Maple Leafs"
-      bet365: "Toronto Maple Leafs"
-      draftkings: "TOR Maple Leafs"
-      fanduel: "Toronto Maple Leafs"
-      betmgm: "Toronto Maple Leafs"
-      caesars: "Toronto Maple Leafs"
-  - name: "Florida Panthers"
-    sportsbook_keys:
-      # ... etc for each team
-  # ... all teams
+polymarket:
+  event_slug: "2026-nhl-stanley-cup-champion"
+  neg_risk: true
+
+# Outcomes discovered from Polymarket — no manual token list.
 
 trade_params:
-  edge_threshold: 0.10        # 10% relative edge required (e.g., fair value 20% → buy at 18c or better)
-  max_outcome_exposure: 200   # max $200 per outcome
-  kelly_fraction: 0.25        # use quarter-Kelly (conservative)
-  min_bet_size: 5             # minimum bet in USDC (skip if Kelly suggests less)
-  max_bet_size: 50            # cap per-trade size regardless of Kelly
-  order_type: "FOK"
-  min_sources: 3              # need at least 3 books agreeing
-  cooldown_minutes: 30        # wait 30 min after a trade before re-evaluating same outcome
-  price_range: [0.03, 0.95]   # only trade in this price range
+  max_outcome_exposure: 200   # overrides global trade_defaults for this market only
 
 scraper:
-  event_key: "2026 NHL Stanley Cup Champion"  # must match key in ScrapedOdds.events
+  event_key: "Stanley Cup Winner"   # must match CSV `market` column / ScrapedOdds.events key
 ```
 
-The plugin no longer has a `data_sources.py` — odds come from the shared scraper. The plugin's `extract_odds()` method uses the `outcomes` name mappings and `scraper.event_key` to pull its slice of the `ScrapedOdds` data.
+Shared **`markets/fair_value.py`** (`FairValueEngine`) performs vig removal and weighted aggregation; weights come from `sportsbook_weight_defaults` in `config.yaml` plus optional `sportsbook_weights` in the plugin YAML.
 
-> **Sportsbook data acquisition:** Custom scrapers fetch odds from sportsbooks. Each scraper can cover one or many events (e.g., one scraper might cover all NHL and NBA events from an aggregator site, while another covers soccer from a different source). All enabled scrapers run in parallel once per cycle, and their outputs are merged into a single `ScrapedOdds` shared across all plugins.
+> **Sportsbook data acquisition:** The **`csv` scraper** reads a normalized file (default `data/normalized_odds.csv`) with columns including `market`, `team`, `sportsbook`, `odds`. Each row is one book’s decimal odds for one outcome. Additional scrapers can be added under `scrapers/` and registered in `main.py` / config.
 
 **Scraper output format:** The scraper returns a single `ScrapedOdds` object containing all events and all sportsbooks:
 
@@ -476,17 +464,17 @@ class ScrapedOdds:
 # )
 ```
 
-Each plugin's `extract_odds()` method pulls its event from `ScrapedOdds.events` using the `scraper.event_key` from its config, then maps outcome names using `sportsbook_keys`. This means:
+For **`FuturesPlugin`**, `extract_odds()` selects `scraped_odds.events[event_key]` and keeps only outcomes that exist in the Gamma-derived `token_map`. No separate `sportsbook_keys` table — **CSV team names must match Polymarket outcome labels**.
 
-- **Adding a new event** only requires a new plugin config — no scraper changes needed if the event is already scraped by an existing scraper
-- **Adding a new sport/source** only requires a new scraper — its output gets merged automatically
-- **Scrapers are fully decoupled** from plugins — build and test them independently
+- **Adding a new futures event:** add `markets/configs/<name>.yaml`, set `type: futures`, slug, `scraper.event_key`, optional `trade_params` / `sportsbook_weights`, and add `<name>` to `enabled_markets`.
+- **Adding a new scraper:** implement `BaseScraper`, register in `main.py` (`KNOWN_SCRAPERS` / loader), add a `scrapers:` entry in `config.yaml`.
+- **Scrapers stay decoupled** from plugin internals as long as the odds contract (`ScrapedOdds`) is honored.
 
 **Scraper base class:**
 
 ```python
 class BaseScraper(ABC):
-    interval: int  # seconds between scrape runs (configured per scraper)
+    interval: int  # seconds between scrape runs (configured per scraper; scheduling = Phase 3 engine)
 
     @abstractmethod
     async def scrape(self) -> ScrapedOdds:
@@ -494,30 +482,21 @@ class BaseScraper(ABC):
 
     @abstractmethod
     def get_name(self) -> str:
-        """Identifier for this scraper, e.g. 'odds_aggregator'"""
+        """Identifier for this scraper, e.g. 'csv'"""
 ```
 
-Each scraper's output is processed independently on arrival — no merging step. If two scrapers happen to cover the same event, each triggers its own evaluation cycle for that event's plugins (the later one simply re-evaluates with fresher data).
+Each scraper's output is processed when the engine invokes it. If multiple scrapers cover the same event, each completion re-runs the pipeline for that data.
 
-`**fair_value.py**`
+**Fair value (`markets/fair_value.py`)**
 
 ```python
-class NHLAtlanticFairValue:
+class FairValueEngine:
     """
-    Converts raw sportsbook odds into fair value probabilities.
-
-    Steps:
-    1. Convert decimal odds to implied probabilities: prob = 1 / odds
-    2. Remove vig from each sportsbook's odds (all outcomes sum to >100%)
-       Method: proportional reduction — divide each prob by the overround
-    3. Aggregate across sportsbooks using a weighted average where each book
-       has a configurable weight (e.g., sharp books like Bet365/Pinnacle get
-       higher weight than softer books). Weights are defined in the plugin's
-       config.yaml.
+    Per-outcome vig removal and weighted aggregation across books.
+    Weights: global sportsbook_weight_defaults + plugin overrides.
     """
-
-    def compute(self, raw_odds: dict) -> list[OutcomeFairValue]:
-        pass
+    def compute(self, mapped_odds: dict[str, list[BookOdds]]) -> dict[str, FairValueResult]:
+        ...
 ```
 
 **Vig removal example:**
@@ -530,19 +509,17 @@ Devigged:       19.3%,              29.0%,              14.5%, ... = sum 100%
 
 ### 4.3 Adding a New Event
 
-To add a new event (e.g., "NHL Atlantic Division Winner"):
+To add a new **futures** event (same pattern as NHL Stanley Cup):
 
-1. Create a new directory `markets/nhl_atlantic/` (use an existing plugin like `nhl_stanley_cup/` as a reference)
-2. Fill in `config.yaml` with:
-  - Polymarket event slug
-  - `scraper.event_key` matching the key the scraper uses for this event
-  - Outcome name mappings (sportsbook names → canonical names)
-  - Trade parameters
-3. Implement `fair_value.py` — may be identical to another event's if the vig removal logic is the same
-4. Add the event to `config.yaml`'s `enabled_markets` list
-5. Restart the bot
+1. Copy `markets/configs/nhl_stanley_cup.yaml` to `markets/configs/<your_market>.yaml`.
+2. Set `name`, `type: futures`, `polymarket.event_slug`, and `scraper.event_key` (must match the `market` column / `ScrapedOdds.events` key your scraper emits).
+3. Optionally override `trade_params` or `sportsbook_weights`.
+4. Ensure the odds file or scraper uses **outcome names identical to Polymarket** for that event.
+5. Add `<your_market>` to `enabled_markets` in `config.yaml`.
 
-No scraper changes needed if the event is already being scraped. No `data_sources.py` needed — the plugin just filters from the shared `ScrapedOdds`.
+No new Python is required unless you introduce a **new plugin type** (then add a class and register it in `main.PLUGIN_TYPES`). Shared `FairValueEngine` covers all futures-style multi-outcome markets.
+
+No `data_sources.py` — the plugin filters from shared `ScrapedOdds`.
 
 ---
 
@@ -580,16 +557,18 @@ Scrapers are fully independent — each has its own interval and lifecycle. A fa
 
 ### 5.2 Polymarket Data
 
-**Two sources, used together:**
+**Phase 2 (current):**
 
-1. **WebSocket (real-time):** Market WS provides live order book updates. The bot maintains a local order book cache (same `SortedDict` approach as the market-maker bot). This gives instant access to current best bid, best ask, and available liquidity at each price level.
-2. **Gamma API (on-demand):** Used at startup to discover token IDs from event slugs, and periodically to cross-check prices. The `bestBid`/`bestAsk` fields from Gamma are the correct effective prices for neg-risk markets.
+1. **CLOB REST order book** — `PolymarketClient.get_order_book` / `get_prices(token_id)` supply `PriceInfo` (best bid, best ask, midpoint) for signal evaluation. Each outcome YES token is queried over HTTP when the dry-run (or future engine) cycle runs.
+2. **Gamma API** — Used at plugin startup to resolve `event_slug` → markets → YES/NO `clobTokenIds` (`get_event`). Not used per tick for prices in the current code path.
+3. **Data API** — `get_positions()` for wallet positions (raw JSON); deeper position tracking is Phase 3.
 
-**Price used for signal generation:**
+**Phase 3+ (target):**
 
-- For neg-risk markets (multi-outcome like division winners): use **Gamma API** `bestBid`/`bestAsk` as the primary price source. The CLOB raw orderbook for neg-risk markets shows misleading prices (~0.001 bids / ~0.999 asks) that don't reflect the effective market.
-- For standard binary markets: use the **WebSocket-maintained local order book** for best bid/ask.
-- In both cases, verify with the **CLOB order book** when executing to confirm liquidity exists at the target price.
+- **Market WebSocket** — Subscribe to monitored token IDs; maintain a local order book cache (e.g., `sortedcontainers.SortedDict`) for faster reads and depth walks. Auto-reconnect with backoff (Phase 4).
+- **Neg-risk note:** For some multi-outcome / neg-risk setups, effective prices may differ from naive CLOB display; if production behavior diverges, validate against Gamma `bestBid`/`bestAsk` or Polymarket docs and adjust the price source in the client or executor.
+
+**Execution-time validation:** Even with WS cache, the **executor** should confirm liquidity at the limit price on the live book before posting FOK/FAK.
 
 ### 5.3 Data Flow Diagram
 
@@ -617,7 +596,7 @@ Scrapers are fully independent — each has its own interval and lifecycle. A fa
              OutcomeFairValues (fair prob per outcome)
                     │
                     │         Polymarket Price
-                    │         (from WS or Gamma)
+                    │         (REST now; WS cache Phase 3+)
                     │              │
                     ▼              ▼
                   Compare: edge > threshold?
@@ -637,6 +616,8 @@ Scrapers are fully independent — each has its own interval and lifecycle. A fa
 ## 6. Signal Generation & Trade Decision
 
 ### 6.1 Signal Evaluation
+
+**Implemented in `core/signal.py` (`evaluate_signals`, etc.):** compares each `OutcomeFairValue` to `PriceInfo` per token (same math as below), plus **`min_sources`**, **`price_range`** on bid/ask, **`sportsbook_buffer`** (relative gap between Polymarket ask and best raw book implied prob), and emits **`Signal`** objects (`core/models.py`). **SELL** signals set `size_usd=0` and `reason="edge_disappeared"` until Phase 3 assigns size from positions. **`check_exits()`** filters SELL signals to held token IDs. Optional book-vs-consensus flags live in **`core/sportsbook_signal.py`** (`config.sportsbook_signals`).
 
 ```python
 def evaluate_signals(fair_values, polymarket_prices, trade_params) -> list[Signal]:
@@ -782,11 +763,13 @@ Quarter-Kelly: $24 * 0.25 = $6.00
 
 ### 6.4 Sell Strategy: Edge Disappearance
 
-The exit strategy is simple: **sell when we can get a favorable price** (at or above fair value). Otherwise, hold to resolution.
+The exit strategy is simple: **sell when we can get a favorable price** relative to our fair value (market bid meaningfully above fair). Otherwise, hold to resolution.
 
-**Sell condition (checked whenever a scraper delivers new data, for all open positions):**
+**Phase 2 implementation:** `core/signal.py` treats **SELL** like BUY but inverted: `sell_edge = (best_bid - fair_value) / fair_value` must exceed `edge_threshold` (and `price_range` / `min_sources` must pass). **`check_exits()`** restricts SELL signals to **`held_token_ids`**. Execution and position-sized sells are **Phase 3**.
 
-- **Fair price available:** `polymarket_best_bid >= fair_value` AND sufficient liquidity at the bid → SELL entire position (FOK at best bid). The mispricing has corrected; take the profit.
+**Sell condition (conceptual — checked whenever fresh odds + prices run, for outcomes we hold):**
+
+- **Edge on exit:** market bid high enough vs fair value (same relative threshold family as entry) **and** sufficient liquidity → SELL (FOK/FAK at best bid). The mispricing has corrected; take the profit.
 - **Hold otherwise:** If the market bid is below fair value, continue holding. The position pays $1 if the outcome occurs, so holding to resolution is always an option. We entered the trade for a reason — no stop-loss, no panic selling.
 
 ```python
@@ -1037,65 +1020,89 @@ Bot state is saved to `data/state.json` on every position change and loaded on s
 
 ### 10.1 `config.yaml` — Global Config
 
+**Authoritative file is the repo’s `config.yaml`.** Below is a structural summary aligned with the current project (values are examples).
+
 ```yaml
-# Polymarket credentials (override with .env)
+# PK and BROWSER_ADDRESS always from .env (see core/utils.py)
 polymarket:
-  # PK and BROWSER_ADDRESS loaded from .env
-  signature_type: 2  # Gnosis Safe proxy wallet
-  chain_id: 137      # Polygon
+  clob_url: "https://clob.polymarket.com"
+  gamma_url: "https://gamma-api.polymarket.com"
+  data_url: "https://data-api.polymarket.com"   # positions / user data
+  chain_id: 137
+  signature_type: 1   # 0=EOA, 1=POLY_PROXY, 2=POLY_GNOSIS_SAFE — must match account type
 
-# Polling and execution
+polygon:
+  rpc_urls:           # tried in order until one connects; may use ${ALCHEMY_API_KEY} etc.
+    - "https://polygon-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}"
+  usdc_address: "0x..."
+
+contracts:
+  exchange: "0x..."
+  neg_risk_exchange: "0x..."
+  ctf: "0x..."
+
 engine:
-  dry_run: false             # set to true (or use --dry-run flag) to log signals without executing
-  position_sync_interval: 60 # seconds between API position syncs + balance checks
-  ws_ping_interval: 5        # WebSocket keepalive interval
-  # Note: scraper intervals are configured per-scraper (see scrapers section)
+  default_order_type: "FOK"    # informational; per-trade type from trade_defaults.order_type
+  dry_run: false               # or pass --dry-run
 
-# Risk management defaults (can be overridden per market)
+# Used for Kelly sizing in dry-run; Phase 3 risk manager enforces the rest
 risk:
-  kelly_bankroll: 1000         # USD — fixed bankroll for Kelly bet sizing (set manually)
-  max_outcome_exposure: 200    # USD per outcome (e.g., one team)
-  max_event_exposure: 500      # USD per event (all outcomes combined)
-  max_portfolio_exposure: 1000 # USD total
-  min_balance: 50              # USD — pause new trades if USDC balance drops below this
-  min_bankroll: 200            # USD — emergency pause if total bankroll drops below this
-  default_cooldown_minutes: 30
+  kelly_bankroll: 2000
+  max_event_exposure: 200
+  max_portfolio_exposure: 500
+  min_balance: 50
+  min_bankroll: 200
 
-# Enabled scrapers (each runs independently on its own interval)
+# Global trade defaults; plugins override per-key via markets/configs/*.yaml trade_params
+trade_defaults:
+  edge_threshold: 0.10
+  max_outcome_exposure: 200
+  kelly_fraction: 0.25
+  min_bet_size: 5
+  max_bet_size: 100
+  order_type: "FAK"          # or FOK — py-clob-client OrderType
+  min_sources: 2
+  cooldown_minutes: 30
+  price_range: [0.01, 0.66]
+  sportsbook_buffer: 0.05    # min relative gap: (poly_ask - best_book_implied) / best_book_implied
+
+sportsbook_weight_defaults:
+  draftkings: 1.0
+  fanduel: 2.0
+  # ...
+
+# Optional diagnostics in dry-run / future logs
+sportsbook_signals:
+  enabled: true
+  edge_threshold: 0.1
+  abs_edge_threshold: 0.01
+  min_sources: 3
+
 scrapers:
-  - name: odds_aggregator        # covers NHL, NBA events
-    interval: 60                  # scrape every 60 seconds
-  # - name: soccer_scraper
-  #   interval: 300               # scrape every 5 minutes
+  - name: csv
+    interval: 60              # seconds — used when Phase 3 engine schedules loops
+    path: "data/normalized_odds.csv"
 
-# Enabled markets (list of plugin directory names)
-enabled_markets:
+enabled_markets:              # basenames of markets/configs/<name>.yaml
   - nhl_stanley_cup
 
-# Logging
 logging:
-  level: INFO
-  file: data/logs/bot.log
+  level: "INFO"
   console: true
-  trade_log: data/logs/trades.log  # separate file for trade events only
-
-# Telegram alerts
-telegram:
-  enabled: true
-  # TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID loaded from .env
-  send_trades: true            # alert on every trade execution
-  send_errors: true            # alert on failures
-  send_daily_summary: true     # P&L summary at midnight UTC
 ```
+
+**Phase 3 / not in YAML yet:** `position_sync_interval`, `ws_ping_interval`, dedicated `telegram:` block — add when `notifier` and engine land. Per-market `max_outcome_exposure` today lives under each plugin config’s `trade_params`.
 
 ### 10.2 Environment Variables (`.env`)
 
+**Current `.env.example` (repo):**
+
 ```
-PK=0x...                          # Private key of Safe owner EOA
-BROWSER_ADDRESS=0x...             # Gnosis Safe contract address
-TELEGRAM_BOT_TOKEN=...            # Telegram bot token from @BotFather
-TELEGRAM_CHAT_ID=...              # Telegram chat ID for alerts
+PK=...
+BROWSER_ADDRESS=...
 ```
+
+**Optional / Phase 3:** `ALCHEMY_API_KEY` (or similar) if referenced inside `polygon.rpc_urls`; **`TELEGRAM_BOT_TOKEN`**, **`TELEGRAM_CHAT_ID`** when Telegram notifier is implemented.
 
 ---
 
@@ -1131,7 +1138,7 @@ TELEGRAM_CHAT_ID=...              # Telegram chat ID for alerts
 
 ### 11.3 Trade Summary Log
 
-A compact CSV log for quick P&L review:
+A compact CSV log for quick P&L review *(**Phase 3** — file not written yet; schema target below)*:
 
 ```csv
 timestamp,event,outcome,side,shares,price,usd,edge_pct,fair_value,kelly_usd,sources,fill,reason
@@ -1188,10 +1195,10 @@ Alerts are **non-blocking** — if Telegram is unreachable, log the failure and 
 
 | Component                                                  | Why                                   | Adaptation                                                                                                              |
 | ---------------------------------------------------------- | ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| **Authentication** (PK, BROWSER_ADDRESS, signature_type=2) | Required for any Polymarket trading   | Direct reuse                                                                                                            |
+| **Authentication** (PK, BROWSER_ADDRESS, `signature_type` from config) | Required for any Polymarket trading   | Direct reuse — type must match account (EOA / proxy / Safe)                                                             |
 | **ClobClient initialization**                              | API key derivation, HTTP client setup | Direct reuse                                                                                                            |
-| **WebSocket connections**                                  | Real-time price data                  | Keep Market WS for live order book                                                                                      |
-| **Order book storage** (SortedDict)                        | Need to know available liquidity      | Keep, but read-only (we don't post passive orders)                                                                      |
+| **WebSocket connections**                                  | Real-time price data                  | **Target:** Market WS in client/engine (Phase 3+). **Today:** smoke test only in `test_connection.py --ws-test`         |
+| **Order book storage** (SortedDict)                        | Need to know available liquidity      | **Target:** local cache with WS. **Today:** REST `get_order_book`; `sortedcontainers` is a dependency but unused in app code yet |
 | **Position tracking** (local + API sync)                   | Must know what we hold                | Simplify — FOK/FAK API responses give immediate fill confirmation; periodic API sync (every 60s) as ground-truth backup |
 | **On-chain approvals**                                     | Required before first trade           | Direct reuse                                                                                                            |
 | **Auto-reconnect for WebSockets**                          | Must stay connected 24/7              | Direct reuse                                                                                                            |
@@ -1233,49 +1240,58 @@ Alerts are **non-blocking** — if Telegram is unreachable, log the failure and 
 
 ## 13. Implementation Phases
 
-### Phase 1: Foundation (Polymarket Client + Data Models)
+### Implementation status (April 2026)
+
+| Phase | Status | Notes |
+| ----- | ------ | ----- |
+| **1** | **Done** | `pyproject.toml` + `uv`, `core/models.py`, `core/polymarket_client.py` (REST CLOB/Gamma/data API, Web3 balances + approvals, `place_order`), `core/state.py`, `core/utils.py`, `test_connection.py`. Market WebSocket **not** integrated into the client — verified via `test_connection.py --ws-test` only. |
+| **2** | **Done** | `scrapers/models.py`, `scrapers/base.py`, `scrapers/csv_scraper.py`, `markets/base.py`, `markets/fair_value.py`, `markets/futures_plugin.py`, `markets/configs/nhl_stanley_cup.yaml`, `core/signal.py`, `core/sportsbook_signal.py`, `main.py` dry-run pipeline, tests `test_fair_value`, `test_signal`, `test_sportsbook_signal`. No stub scraper in repo. Scraper `interval` is stored but **not** used until Phase 3 loops. |
+| **3** | **Next** | Live trading loop, executor wrapping `place_order`, risk enforcement, positions/P&L, CSV log, notifier, optional WS cache in client. |
+| **4–5** | Planned | As below. |
+
+### Phase 1: Foundation (Polymarket Client + Data Models) — complete
 
 **Goal:** Connect to Polymarket, authenticate, read prices, and place a test order.
 
-1. Set up project structure and dependencies
-2. Implement `core/models.py`: data classes (Signal, Position, Order, PriceInfo, etc.)
-3. Implement `core/polymarket_client.py`:
-  - Authentication (PK, BROWSER_ADDRESS, ClobClient)
-  - Gamma API: fetch event by slug → get token IDs, prices
-  - CLOB API: fetch order book, place order, cancel order
-  - `get_usdc_balance()`: query USDC balance on Polygon via web3
-  - Market WebSocket: connect to Market WS, receive price updates
-4. Implement `core/state.py`: save/load state to JSON
-5. **Test:** manually place a small FOK order on a test market to verify the full auth + execution flow works
+1. ~~Set up project structure and dependencies~~ (`pyproject.toml`, `uv`)
+2. ~~Implement `core/models.py`~~ — `PriceInfo`, `MarketInfo`, `EventInfo`, `OrderResult`, `Position`, `BankrollSnapshot`, `Signal`, `SportsbookSignal`
+3. ~~Implement `core/polymarket_client.py`~~:
+  - Authentication (PK, `BROWSER_ADDRESS`, `ClobClient`, `signature_type` from YAML)
+  - Gamma: `get_event(slug)` → token IDs
+  - CLOB: `get_order_book`, `get_prices`, `place_order` (FOK/FAK), exchange balance
+  - `get_usdc_balance()` (wallet), `get_exchange_balance()`, `get_positions()` (data API)
+  - **Deferred:** WebSocket inside client; **cancel_order** wrapper (add if executor needs it)
+4. ~~Implement `core/state.py`~~ — `StateManager`, JSON persistence
+5. **Test:** `test_connection.py` (including optional `--place-order` / `--fill-order` / `--ws-test`)
 
-### Phase 2: Scraper Interface + First Market Plugin (NHL Stanley Cup)
+### Phase 2: Scraper Interface + First Market (NHL Stanley Cup) — complete
 
-**Goal:** Define scraper output format, compute fair values, generate signals.
+**Goal:** Scraper contract, fair values, signals, dry-run end-to-end.
 
-1. Implement `scrapers/models.py`: `ScrapedOdds`, `EventOdds`, `BookOdds` data classes
-2. Implement `scrapers/base.py`: abstract scraper interface (`BaseScraper`)
-3. Implement a **stub scraper** that returns hardcoded/mock `ScrapedOdds` for testing (real scrapers built separately)
-4. Implement `markets/base.py` (plugin interface with `extract_odds()`)
-5. Implement `markets/nhl_stanley_cup/`:
-  - `fair_value.py`: vig removal, aggregation, configurable book weighting
-  - `plugin.py`: `extract_odds()` filtering + name mapping, ties everything together
-  - `config.yaml`: outcome mappings, event key, trade params
-6. Implement `core/signal.py`: signal evaluation (relative edge) + Kelly criterion bet sizing
-7. Implement `--dry-run` flag (CLI argument + config option)
-8. **Test:** verify fair value calculations against manual spreadsheet. Verify Kelly sizing produces sensible bet sizes across a range of edges/prices. Run signal generation in dry-run mode (log signals but don't execute).
+1. ~~`scrapers/models.py`~~ — `ScrapedOdds`, `EventOdds`, `BookOdds`
+2. ~~`scrapers/base.py`~~ — `BaseScraper`
+3. **Stub scraper** — not shipped; CSV path is the test/prod input
+4. ~~`markets/base.py`~~ — `MarketPlugin`, `OutcomeFairValue`, `TradeParams.from_config`
+5. ~~First market~~ — **`FuturesPlugin`** + **`markets/configs/nhl_stanley_cup.yaml`** (not a per-event Python package). **`markets/fair_value.py`** — `FairValueEngine`. Outcomes auto-discovered from Gamma; CSV outcome names must match Polymarket.
+6. ~~`core/signal.py`~~ — edge filters, Kelly sizing, BUY/SELL signals, `check_exits`. Config-driven `sportsbook_buffer`, `price_range`, etc.
+7. ~~`core/sportsbook_signal.py`~~ — optional outlier diagnostics (`sportsbook_signals` in YAML)
+8. ~~`--dry-run` / `engine.dry_run`~~ — single pass over scrapers in `main.py`
+9. **Tests:** ~~`tests/test_fair_value.py`, `test_signal.py`, `test_sportsbook_signal.py`~~
 
-### Phase 3: Execution, Risk & Monitoring
+### Phase 3: Execution, Risk & Monitoring — next
 
-**Goal:** Execute real trades with proper risk controls, logging, and alerts.
+**Goal:** Long-running bot, real execution, risk enforcement, observability.
 
-1. Implement `core/executor.py`: order placement with FOK (FAK fallback), liquidity checks
-2. Implement `core/risk_manager.py`: all risk gates (exposure limits, balance checks, cooldowns)
-3. Implement `core/position_tracker.py`: position tracking, P&L, balance/bankroll monitoring
-4. Implement exit logic: sell when market bid reaches fair value (edge disappeared)
-5. Implement CSV trade logging
-6. Implement `core/notifier.py`: Telegram alerts (trades, errors, daily summary)
-7. Implement `core/engine.py`: independent scraper loops (`asyncio.create_task` per scraper), each triggering the signal → risk → execute pipeline on completion
-8. **Test:** run with very small position sizes ($5-10) on the live market. Monitor fills, P&L, and signal accuracy via CSV log and Telegram alerts.
+1. **`core/executor.py`** — Wrap existing `PolymarketClient.place_order`: map `Signal` → size in shares, FOK/FAK from `TradeParams`, **liquidity / depth checks** before submit; handle partial fills for FAK; neg-risk nuances per §7.3 if needed.
+2. **`core/risk_manager.py`** — Enforce `risk.*` and `trade_defaults` / per-plugin caps: `max_outcome_exposure`, `max_event_exposure`, `max_portfolio_exposure`, `min_balance`, `min_bankroll`, **cooldowns** (persist via `state.json`).
+3. **`core/position_tracker.py`** — Reconcile `get_positions()` + fills; average cost; P&L hooks.
+4. **Exit path** — **`check_exits()`** and SELL **`Signal`** generation already exist; Phase 3 **sizes** SELLs from holdings and **routes** through executor.
+5. **CSV trade logging** — e.g. `data/trades.csv` (schema per §11.3).
+6. **`core/notifier.py`** — Telegram (or similar); env vars documented in `.env.example` when added.
+7. **`core/engine.py`** — `asyncio.create_task` **per-scraper** with `await asyncio.sleep(scraper.interval)`; on each scrape completion run plugin → signal → risk → execute; optional **WS** task updating a price cache; background position/balance sync.
+8. **`main.py`** — Live mode entry: start engine instead of exiting after dry-run.
+9. **Tests:** add `test_risk_manager`, `test_executor`, integration tests as appropriate.
+10. **Test (live):** small sizes ($5–10), monitor fills and logs.
 
 ### Phase 4: Hardening
 
@@ -1294,8 +1310,8 @@ Alerts are **non-blocking** — if Telegram is unreachable, log the failure and 
 
 **Goal:** Add more events using the plugin system.
 
-1. Create plugins for additional events (other NHL divisions, conferences) — no scraper changes needed if already scraped
-2. Potentially expand to other sports or non-sports events
+1. Add **`markets/configs/<new>.yaml`** + `enabled_markets` entry (same `FuturesPlugin` pattern) — no scraper changes if the CSV already includes the new `market` key
+2. Potentially expand to other sports or non-sports events; new **plugin types** only if behavior diverges from futures
 3. Refine edge thresholds and position sizing based on Phase 4 learnings
 
 ---
@@ -1313,12 +1329,14 @@ Alerts are **non-blocking** — if Telegram is unreachable, log the failure and 
 | Package            | Purpose                                                                 |
 | ------------------ | ----------------------------------------------------------------------- |
 | `py-clob-client`   | Polymarket CLOB API client (order signing, placement)                   |
-| `web3`             | Polygon RPC for on-chain operations (balance checks, approvals)         |
-| `websockets`       | Real-time market data stream                                            |
-| `curl_cffi`        | HTTP requests with browser TLS fingerprinting (for sportsbook scraping) |
+| `web3`             | Polygon RPC for on-chain operations (balance checks, approvals)       |
+| `requests`         | HTTP client for Gamma / data-api endpoints in `polymarket_client`       |
+| `websockets`       | Used by `test_connection.py` WS smoke test; engine/client WS in Phase 3+ |
+| `curl_cffi`        | Reserved for TLS-fingerprinted HTTP (future sportsbook scrapers)      |
 | `pyyaml`           | Configuration file parsing                                              |
-| `sortedcontainers` | Efficient order book storage (SortedDict)                               |
-| `python-dotenv`    | Load .env file                                                          |
+| `sortedcontainers` | Planned for local order book / depth (`SortedDict`); not used in app code yet |
+| `python-dotenv`    | Load `.env`                                                             |
+| `pytest` / `pytest-asyncio` | Dev — tests in `tests/`                                         |
 
 
 ### Why Not Google Sheets?
@@ -1327,9 +1345,11 @@ The market-maker uses Sheets because a human operator frequently adjusts which m
 
 ### Why Polling Instead of Pure WebSocket?
 
-Sportsbook odds for futures markets change a few times per day, not sub-second. Polling on scraper-specific intervals (30s to 5min depending on the source) is more than sufficient. Each scraper runs independently on its own schedule, and the downstream pipeline (fair value computation, signal evaluation, order placement) completes in under 1 second. The Polymarket side uses WebSockets for real-time price data, but signal generation is driven by the slower sportsbook polling cadence.
+Sportsbook odds for futures markets change a few times per day, not sub-second. Polling on scraper-specific intervals (30s to 5min depending on the source) is more than sufficient. Each scraper will run independently on its own schedule once **`core/engine.py`** exists; Phase 2 dry-run triggers scrapers **once per process** without sleeping on `interval`.
 
-### Order Type Choice: FOK over GTC
+On the **Polymarket** side, **Phase 2** uses **REST** order books for best bid/ask. A **Market WebSocket** (with optional local `SortedDict` book) is the natural Phase 3/4 upgrade for fresher prices and depth — not required to close the first live execution milestone.
+
+### Order Type Choice: FOK / FAK over GTC
 
 A GTC order that doesn't immediately fill sits on the order book as a passive limit order. This is problematic because:
 
@@ -1337,4 +1357,4 @@ A GTC order that doesn't immediately fill sits on the order book as a passive li
 2. We become a de facto market maker, exposed to adverse selection
 3. We'd need to manage order lifecycle (cancel stale orders, etc.)
 
-FOK eliminates all of this: fill now or don't. If the price we want isn't available, we simply wait for the next polling cycle.
+**FOK** eliminates all of this: fill now or don't. **FAK** fills what it can and cancels the rest — useful when the book is thin. Default **`trade_defaults.order_type`** in config may be **FAK** or **FOK** depending on deployment; both map to `py-clob-client` `OrderType`. If the price we want isn't available, wait for the next scraper cycle.
