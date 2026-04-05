@@ -200,7 +200,9 @@ Execution simplification for initial Phase 3:
 
 Add a lightweight writer for `data/trades.csv` with schema aligned to `plan.md`:
 
-`timestamp,event,outcome,token_id,side,shares,price,usd,edge_pct,fair_value,kelly_usd,sources,order_type,status,order_id,reason`
+`timestamp,event,outcome,token_id,side,shares,price,usd,edge_pct,fair_value,kelly_usd,sources,odds_scrape_ts,odds_fanduel,odds_draftkings,odds_betmgm,odds_betrivers,odds_bet365,odds_caesars,odds_thescore,odds_ozoon,odds_bol,odds_betano,odds_pinnacle,order_type,status,order_id,reason`
+
+Fixed sportsbook columns: `odds_fanduel`, `odds_draftkings`, `odds_betmgm`, `odds_betrivers`, `odds_bet365`, `odds_caesars`, `odds_thescore`, `odds_ozoon`, `odds_bol`, `odds_betano`, `odds_pinnacle`. Values are decimal odds from each book for this outcome (empty if book didn't cover it). Source: raw `BookOdds.odds` values keyed by book name. `odds_scrape_ts` is the timestamp of the scrape cycle that produced the odds (CSV last-modified or explicit scraper timestamp); diff against `timestamp` to measure scrape-to-trade latency.
 
 Rules:
 

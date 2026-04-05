@@ -1142,10 +1142,14 @@ BROWSER_ADDRESS=...
 A compact CSV log for quick P&L review *(**Phase 3** — file not written yet; schema target below)*:
 
 ```csv
-timestamp,event,outcome,side,shares,price,usd,edge_pct,fair_value,kelly_usd,sources,fill,reason
-2026-03-19T14:30:00Z,Stanley Cup,Leafs,BUY,33,0.18,5.94,10.0,0.200,6.00,5,FILLED,edge_detected
-2026-03-20T09:15:00Z,Stanley Cup,Leafs,SELL,33,0.21,6.93,0.0,0.210,0,5,FILLED,edge_disappeared
+timestamp,event,outcome,side,shares,price,usd,edge_pct,fair_value,kelly_usd,sources,odds_scrape_ts,odds_fanduel,odds_draftkings,odds_betmgm,odds_betrivers,odds_bet365,odds_caesars,odds_thescore,odds_ozoon,odds_bol,odds_betano,odds_pinnacle,fill,reason
+2026-03-19T14:30:00Z,Stanley Cup,Leafs,BUY,33,0.18,5.94,10.0,0.200,6.00,3,2026-03-19T14:29:45Z,5.55,5.60,,,5.50,,,,,,FILLED,edge_detected
+2026-03-20T09:15:00Z,Stanley Cup,Leafs,SELL,33,0.21,6.93,0.0,0.210,0,3,2026-03-20T09:14:50Z,4.55,4.45,,,4.50,,,,,,FILLED,edge_disappeared
 ```
+
+**Per-sportsbook odds columns:** Fixed set of columns for all known sportsbooks: `odds_fanduel`, `odds_draftkings`, `odds_betmgm`, `odds_betrivers`, `odds_bet365`, `odds_caesars`, `odds_thescore`, `odds_ozoon`, `odds_bol`, `odds_betano`, `odds_pinnacle`. Each contains the **decimal odds** that fed the fair value calculation for this outcome. Empty if that book didn't have odds for the outcome. Most will be empty until scrapers are added for those books.
+
+**`odds_scrape_ts`:** Timestamp of the most recent scrape cycle that produced the odds row (i.e., the CSV file's last-modified time or an explicit timestamp from the scraper). Comparing this to `timestamp` (trade placement time) shows scrape-to-trade latency.
 
 ### 11.4 Telegram Alerts
 
