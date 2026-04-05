@@ -566,6 +566,7 @@ Scrapers are fully independent — each has its own interval and lifecycle. A fa
 **Phase 3+ (target):**
 
 - **Market WebSocket** — Subscribe to monitored token IDs; maintain a local order book cache (e.g., `sortedcontainers.SortedDict`) for faster reads and depth walks. Auto-reconnect with backoff (Phase 4).
+- **WS-triggered scraping (hybrid, Phase 4)** — In addition to the local book cache, use WebSocket ask updates above a configurable size threshold (e.g., $50) to trigger an immediate scraper run for that specific market. This supplements periodic polling — it catches Polymarket-side moves faster, while the polling loop still catches edge created by sportsbook-side line movement (where the Polymarket book doesn't change). Requires debouncing/throttling to avoid hammering scrapers on chatty markets. Depends on stable WS connection and live scraper loops from Phase 3.
 - **Neg-risk note:** For some multi-outcome / neg-risk setups, effective prices may differ from naive CLOB display; if production behavior diverges, validate against Gamma `bestBid`/`bestAsk` or Polymarket docs and adjust the price source in the client or executor.
 
 **Execution-time validation:** Even with WS cache, the **executor** should confirm liquidity at the limit price on the live book before posting FOK/FAK.

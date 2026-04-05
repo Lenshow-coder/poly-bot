@@ -57,7 +57,7 @@ What is missing is orchestration and enforcement: `engine`, `risk_manager`, `exe
 
 ### Optional in Phase 3 (only if low-risk after core path is stable)
 
-1. `core/notifier.py` (Telegram or equivalent, non-blocking)
+1. `core/notifier.py` (Telegram, non-blocking)
 2. WS price cache integration in client/engine (REST remains fallback)
 
 ### Explicitly Out of Scope
