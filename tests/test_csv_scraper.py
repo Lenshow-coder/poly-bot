@@ -25,6 +25,11 @@ def _write_csv(tmp_dir: str, content: str, filename: str = "odds.csv") -> str:
     return path
 
 
+def _append_csv(path: str, content: str) -> None:
+    with open(path, "a", newline="") as f:
+        f.write(content)
+
+
 VALID_CSV = """\
 timestamp,sport,sportsbook,market,team,odds
 04/01/2026 12:00,NHL,DraftKings,Stanley Cup Winner,Toronto Maple Leafs,4.50
@@ -154,6 +159,68 @@ timestamp,sport,sportsbook,market,team,odds
     assert (
         result.events["NBA Champion"].timestamp
         == datetime(2026, 4, 1, 11, 59, tzinfo=timezone.utc)
+    )
+
+
+def test_scrape_incremental_appends_only_new_rows():
+    """Second scrape consumes appended rows and preserves prior market state."""
+    initial = """\
+timestamp,sport,sportsbook,market,team,odds
+04/01/2026 12:00,NHL,DraftKings,Stanley Cup Winner,Team A,2.50
+04/01/2026 12:00,NHL,FanDuel,Stanley Cup Winner,Team B,3.50
+04/01/2026 11:59,NBA,DraftKings,NBA Champion,Team C,5.00
+"""
+    with tempfile.TemporaryDirectory() as d:
+        path = _write_csv(d, initial)
+        scraper = CsvScraper(name="csv", interval=60, path=path)
+        first = _run(scraper.scrape())
+
+        _append_csv(
+            path,
+            "04/01/2026 11:58,NBA,FanDuel,NBA Champion,Team C,5.20\n"
+            "04/01/2026 12:01,NBA,FanDuel,NBA Champion,Team C,4.80\n",
+        )
+        second = _run(scraper.scrape())
+
+    assert first.events["Stanley Cup Winner"].timestamp == datetime(
+        2026, 4, 1, 12, 0, tzinfo=timezone.utc
+    )
+    assert first.events["NBA Champion"].timestamp == datetime(
+        2026, 4, 1, 11, 59, tzinfo=timezone.utc
+    )
+
+    # NHL unchanged because no NHL append.
+    assert second.events["Stanley Cup Winner"].timestamp == datetime(
+        2026, 4, 1, 12, 0, tzinfo=timezone.utc
+    )
+    # NBA advances to appended latest.
+    assert second.events["NBA Champion"].timestamp == datetime(
+        2026, 4, 1, 12, 1, tzinfo=timezone.utc
+    )
+    assert second.events["NBA Champion"].outcomes["Team C"][0].decimal_odds == 4.80
+
+
+def test_scrape_resets_after_file_truncation():
+    """If file is replaced/truncated, scraper resets incremental state."""
+    initial = """\
+timestamp,sport,sportsbook,market,team,odds
+04/01/2026 12:00,NHL,DraftKings,Stanley Cup Winner,Team A,2.50
+"""
+    replacement = """\
+timestamp,sport,sportsbook,market,team,odds
+04/01/2026 12:05,NBA,DraftKings,NBA Champion,Team C,4.20
+"""
+    with tempfile.TemporaryDirectory() as d:
+        path = _write_csv(d, initial)
+        scraper = CsvScraper(name="csv", interval=60, path=path)
+        _run(scraper.scrape())
+        _write_csv(d, replacement)
+        result = _run(scraper.scrape())
+
+    assert "Stanley Cup Winner" not in result.events
+    assert "NBA Champion" in result.events
+    assert result.events["NBA Champion"].timestamp == datetime(
+        2026, 4, 1, 12, 5, tzinfo=timezone.utc
     )
 
 

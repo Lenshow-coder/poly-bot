@@ -5,3 +5,8 @@ __pycache__/
 *.egg-info/
 *.pyc
 .pytest_cache/
+runner/state/runner.log
+runner/state/runner.pid
+runner/state/runner_status.json
+runner/state/stop.signal
+runner/state/*.tmp
