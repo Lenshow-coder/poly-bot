@@ -43,6 +43,26 @@ class OrderResult:
 
 
 @dataclass
+class ExecutionResult:
+    status: str
+    token_id: str
+    side: str
+    requested_shares: float
+    filled_shares: float
+    requested_price: float
+    avg_fill_price: float
+    order_id: str = ""
+    reason: str = ""
+
+
+@dataclass
+class RiskDecision:
+    approved: bool
+    adjusted_size_usd: float
+    reason: str
+
+
+@dataclass
 class Position:
     token_id: str
     outcome_name: str

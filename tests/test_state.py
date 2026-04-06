@@ -182,3 +182,18 @@ def test_save_no_args():
         assert state["bankroll"] is None
         assert state["positions"] == []
         assert state["cooldowns"] == {}
+
+
+def test_round_trip_reconcile_meta():
+    """Save and load reconcile metadata used by tracker safety guards."""
+    with tempfile.TemporaryDirectory() as d:
+        sm = StateManager(state_dir=d)
+        reconcile_meta = {
+            "last_local_trade_at": {"tok1": "2026-04-01T12:00:00+00:00"},
+            "consecutive_empty_syncs": 2,
+            "missing_seen_counts": {"tok1": 1},
+        }
+        sm.save(reconcile_meta=reconcile_meta)
+        state = sm.load()
+        assert state["reconcile_meta"]["consecutive_empty_syncs"] == 2
+        assert state["reconcile_meta"]["missing_seen_counts"]["tok1"] == 1

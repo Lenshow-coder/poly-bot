@@ -114,6 +114,49 @@ timestamp,sport,sportsbook,market,team,odds
     assert "NBA Champion" in result.events
 
 
+def test_scrape_latest_timestamp_batch_per_market():
+    """Only rows from each market's most recent timestamp are returned."""
+    csv_data = """\
+timestamp,sport,sportsbook,market,team,odds
+04/01/2026 11:59,NHL,DraftKings,Stanley Cup Winner,Team A,3.00
+04/01/2026 11:59,NHL,FanDuel,Stanley Cup Winner,Team B,4.00
+04/01/2026 12:00,NHL,DraftKings,Stanley Cup Winner,Team A,2.50
+04/01/2026 12:00,NHL,FanDuel,Stanley Cup Winner,Team B,3.50
+04/01/2026 11:58,NBA,DraftKings,NBA Champion,Team C,5.50
+04/01/2026 11:59,NBA,DraftKings,NBA Champion,Team C,5.00
+04/01/2026 11:59,NBA,FanDuel,NBA Champion,Team D,6.00
+"""
+    with tempfile.TemporaryDirectory() as d:
+        path = _write_csv(d, csv_data)
+        scraper = CsvScraper(name="csv", interval=60, path=path)
+        result = _run(scraper.scrape())
+
+    assert result.timestamp.year == 2026
+    assert result.timestamp.month == 4
+    assert result.timestamp.day == 1
+    assert result.timestamp.hour == 12
+    assert result.timestamp.minute == 0
+    assert len(result.events) == 2
+    assert "Stanley Cup Winner" in result.events
+    assert "NBA Champion" in result.events
+    # Older Stanley Cup lines should not survive.
+    team_a_rows = result.events["Stanley Cup Winner"].outcomes["Team A"]
+    assert len(team_a_rows) == 1
+    assert team_a_rows[0].decimal_odds == 2.50
+    assert (
+        result.events["Stanley Cup Winner"].timestamp
+        == datetime(2026, 4, 1, 12, 0, tzinfo=timezone.utc)
+    )
+    # NBA keeps 11:59 rows because that's NBA's latest market timestamp.
+    nba_team_c_rows = result.events["NBA Champion"].outcomes["Team C"]
+    assert len(nba_team_c_rows) == 1
+    assert nba_team_c_rows[0].decimal_odds == 5.00
+    assert (
+        result.events["NBA Champion"].timestamp
+        == datetime(2026, 4, 1, 11, 59, tzinfo=timezone.utc)
+    )
+
+
 # ---------------------------------------------------------------------------
 # Error handling
 # ---------------------------------------------------------------------------

@@ -8,6 +8,7 @@ import yaml
 
 from core.utils import setup_logging, load_config, ensure_data_dir
 from core.polymarket_client import PolymarketClient
+from core.engine import Engine
 from core.signal import evaluate_signals
 from core.sportsbook_signal import evaluate_sportsbook_signals
 
@@ -175,12 +176,16 @@ async def dry_run_cycle(scrapers, plugins, client, config):
 
 def main():
     parser = argparse.ArgumentParser(description="Poly-bot")
-    parser.add_argument("--dry-run", action="store_true", help="Log signals without executing")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run a single diagnostics cycle (legacy dry-run)",
+    )
     args = parser.parse_args()
 
     config = load_config()
     validate_config(config)
-    dry_run = args.dry_run or config.get("engine", {}).get("dry_run", False)
+    engine_dry_run = config.get("engine", {}).get("dry_run", False)
 
     setup_logging(
         level=config.get("logging", {}).get("level", "INFO"),
@@ -198,11 +203,19 @@ def main():
     scrapers = load_scrapers(config)
     logger.info(f"Loaded {len(plugins)} plugins, {len(scrapers)} scrapers")
 
-    if dry_run:
-        logger.info("Running in DRY RUN mode — no orders will be placed")
+    if args.dry_run:
+        logger.info("Running one diagnostics dry-run cycle")
         asyncio.run(dry_run_cycle(scrapers, plugins, client, config))
     else:
-        logger.info("Live mode not yet implemented (Phase 3)")
+        logger.info(
+            "Starting persistent engine loop (mode=%s)",
+            "dry-run" if engine_dry_run else "live",
+        )
+        engine = Engine(config=config, client=client, plugins=plugins, scrapers=scrapers)
+        try:
+            asyncio.run(engine.run_forever())
+        except KeyboardInterrupt:
+            logger.info("Shutdown requested by user")
 
 
 if __name__ == "__main__":

@@ -26,6 +26,7 @@ class StateManager:
             "bankroll": None,
             "positions": [],
             "cooldowns": {},
+            "reconcile_meta": {},
         }
 
     def load(self) -> dict:
@@ -57,11 +58,13 @@ class StateManager:
         bankroll: BankrollSnapshot | None = None,
         positions: list[Position] | None = None,
         cooldowns: dict | None = None,
+        reconcile_meta: dict | None = None,
     ) -> None:
         state = {
             "bankroll": bankroll.to_dict() if bankroll else None,
             "positions": [p.to_dict() for p in (positions or [])],
             "cooldowns": cooldowns or {},
+            "reconcile_meta": reconcile_meta or {},
         }
 
         # Atomic write: write to temp file then replace

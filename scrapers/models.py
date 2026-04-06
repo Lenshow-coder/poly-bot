@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Optional
 
 
 @dataclass
@@ -12,6 +13,7 @@ class BookOdds:
 class EventOdds:
     event_name: str                            # e.g., "2026 NHL Stanley Cup Champion"
     outcomes: dict[str, list[BookOdds]]        # sportsbook-native outcome name → list of BookOdds
+    timestamp: Optional[datetime] = None        # latest scrape timestamp for this market/event batch
 
 
 @dataclass
