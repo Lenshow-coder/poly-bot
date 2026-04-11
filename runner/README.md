@@ -13,7 +13,7 @@ This folder contains a lightweight local dashboard and background runner for `ma
 From repo root:
 
 ```bash
-.venv/Scripts/python.exe runner/dashboard.py --port 8766 --open-browser
+.venv/Scripts/python.exe -m runner.dashboard --port 8766 --open-browser
 ```
 
 Or on Windows, double-click:
@@ -25,6 +25,9 @@ Then use the controls in the browser:
 - **Start**: launch runner in background
 - **Stop (graceful)**: request clean shutdown (Ctrl+Break/SIGTERM)
 - **Kill now**: immediate process kill
+- **Quick settings**: edit key knobs in a form and save
+- **Advanced YAML editor**: full `config.yaml` load/validate/save
+- **Shut down dashboard**: stop local dashboard server (runner can keep running)
 
 ## Mode options
 
@@ -37,5 +40,7 @@ Default dashboard URL is `http://127.0.0.1:8766`.
 ## Notes
 
 - The runner prefers `.venv/Scripts/python.exe` (fallback to current interpreter).
+- `runner.vbs` uses `.venv/Scripts/pythonw.exe` when available so the launcher is windowless.
 - Closing browser/dashboard does not stop a running background runner.
 - Logs and status live in `runner/state/`.
+- Saving config from the dashboard creates backups in `config.backups/`.

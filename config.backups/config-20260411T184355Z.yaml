@@ -1,0 +1,87 @@
+polymarket:
+  clob_url: "https://clob.polymarket.com"       # Base URL for Polymarket CLOB trading API
+  gamma_url: "https://gamma-api.polymarket.com" # Base URL for Gamma event/market metadata API
+  data_url: "https://data-api.polymarket.com"   # Base URL for Polymarket data API (positions/user data)
+  chain_id: 137                                 # Polygon mainnet chain ID used by the CLOB client
+  signature_type: 1                             # Signature mode for account auth (1=email/social, 2=safe, 0=eoa)
+
+polygon:
+  rpc_urls:                                      # Ordered fallback RPC endpoints for Polygon connectivity
+    - "https://polygon-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}" # Preferred paid endpoint
+    - "https://polygon-rpc.com"                  # Public fallback endpoint
+    - "https://rpc.ankr.com/polygon"             # Public fallback endpoint
+    - "https://polygon.llamarpc.com"             # Public fallback endpoint
+  usdc_address: "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359" # USDC token contract on Polygon
+
+contracts:
+  exchange: "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"       # Standard Polymarket exchange contract
+  neg_risk_exchange: "0xC5d563A36AE78145C45a50134d48A1215220f80a" # Neg-risk exchange contract
+  ctf: "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"            # Conditional Tokens Framework contract
+
+engine:
+  default_order_type: "FOK"                      # Global fallback order type if plugin/order settings are missing
+  dry_run: true                                 # If true, run full pipeline but do not place live orders
+  position_sync_interval: 60                     # Seconds between API reconciliation cycles
+  loop_error_backoff_seconds: 5                  # Sleep after loop errors before retrying
+  precheck_liquidity: false                      # Enable optional pre-submit liquidity checks (reserved)
+  trade_log_path: "data/trades.csv"              # CSV file path for execution attempt logging
+  ws_enabled: false                              # Enable websocket price cache (disabled in this phase)
+  ws_ping_interval: 20                           # Seconds between websocket keepalive pings
+  mark_cooldown_on_reject: true                  # Apply cooldown even when an order is rejected/errors
+  reject_cooldown_minutes: 5                     # Cooldown length after rejected/failed order attempts
+
+risk:
+  kelly_bankroll: 2000          # Total bankroll ($) used for Kelly criterion bet sizing
+  max_event_exposure: 200      # Max $ exposure allowed on any single event
+  max_portfolio_exposure: 500  # Max $ exposure across all open positions combined
+  min_balance: 50              # Minimum wallet balance ($) before bot stops placing new trades
+  min_bankroll: 200            # Minimum bankroll ($) threshold; below this, bot pauses trading
+  reconcile_tolerance_pct: 0.05 # Warn if local/API position size mismatch exceeds this percentage
+  size_clip_enabled: true       # Clip oversize BUY signals to limits instead of hard-rejecting
+  reconcile_local_fill_grace_seconds: 30 # Delay overwrite after local fill to avoid stale API rollback
+  reconcile_empty_sync_threshold: 2       # Consecutive empty API syncs required before treating as valid
+  reconcile_missing_sync_threshold: 2     # Consecutive missing token syncs required before local deletion
+
+# Global defaults for trade params. Every plugin inherits these unless it
+# overrides a specific key in its own trade_params section.
+trade_defaults:
+  edge_threshold: 0.10         # Minimum edge (our fair price vs market price) required to place a trade
+  max_outcome_exposure: 200    # Max $ exposure on a single outcome (e.g. "Team X wins")
+  kelly_fraction: 0.25         # Fraction of full Kelly bet to use (0.25 = quarter-Kelly, more conservative)
+  min_bet_size: 5              # Minimum trade size ($); trades smaller than this are skipped
+  max_bet_size: 100            # Maximum trade size ($) regardless of Kelly recommendation
+  order_type: "FAK"            # Default order type: FAK (Fill-And-Kill) or FOK (Fill-Or-Kill)
+  min_sources: 2               # Minimum number of sportsbook sources required before trusting a consensus line
+  cooldown_minutes: 30         # Minutes to wait after trading an outcome before trading it again
+  price_range: [0.01, 0.66]   # Only trade markets with prices in this range (avoid extremes near 0 or 1)
+  sportsbook_buffer: 0.05     # Min relative gap between poly ask and best raw sportsbook implied prob
+
+# Global defaults for sportsbook weights. Plugins inherit these and can
+# override individual book weights in their own sportsbook_weights section.
+# Names must be lowercase (CSV scraper lowercases on read).
+sportsbook_weight_defaults:
+  draftkings: 1.0  # Relative weight for DraftKings odds in fair value consensus
+  fanduel: 2.0     # Relative weight for FanDuel odds in fair value consensus
+  betmgm: 1.0      # Relative weight for BetMGM odds in fair value consensus
+  betrivers: 1.0   # Relative weight for BetRivers odds in fair value consensus
+  bet365: 1.0      # Relative weight for Bet365 odds in fair value consensus
+  caesars: 1.0     # Relative weight for Caesars odds in fair value consensus
+  thescore: 1.0    # Relative weight for TheScore odds in fair value consensus
+
+sportsbook_signals:
+  enabled: true            # Enable outlier sportsbook signal generation/logging
+  edge_threshold: 0.1         # Min relative deviation from consensus to flag a book as outlier
+  abs_edge_threshold: 0.01   # Min absolute probability difference from consensus to flag
+  min_sources: 3               # Skip outcomes with fewer contributing books
+
+scrapers:
+  - name: csv                       # Scraper implementation to use
+    interval: 300                    # Seconds between runs for this scraper
+    path: "data/normalized_odds.csv" # Input data source for CSV scraper
+
+enabled_markets:
+  - nhl_stanley_cup # Market config slug to load from markets/configs
+
+logging:
+  level: "INFO" # Root log verbosity level
+  console: true # If true, emit logs to stdout in addition to file logs

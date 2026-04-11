@@ -16,6 +16,7 @@ contracts:
   neg_risk_exchange: '0xC5d563A36AE78145C45a50134d48A1215220f80a'
   ctf: '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045'
 engine:
+  default_order_type: FOK
   dry_run: true
   position_sync_interval: 60
   loop_error_backoff_seconds: 5

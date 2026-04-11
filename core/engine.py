@@ -35,11 +35,8 @@ class Engine:
         self.reconcile_missing_sync_threshold = int(
             self.risk_cfg.get("reconcile_missing_sync_threshold", 2)
         )
-        self.default_order_type = str(
-            self.engine_cfg.get(
-                "default_order_type",
-                self.config.get("trade_defaults", {}).get("order_type", "FOK"),
-            )
+        self.trade_default_order_type = str(
+            self.config.get("trade_defaults", {}).get("order_type", "FOK")
         ).upper()
         self.mark_cooldown_on_reject = bool(
             self.engine_cfg.get("mark_cooldown_on_reject", False)
@@ -195,7 +192,7 @@ class Engine:
                     scrape_timestamp=scrape_timestamp,
                     sportsbook_odds=sportsbook_odds,
                     sources_books=sources_books,
-                    order_type_override=(trade_params.order_type or self.default_order_type),
+                    order_type_override=(trade_params.order_type or self.trade_default_order_type),
                     mark_cooldown_on_reject=self.mark_cooldown_on_reject,
                     reject_cooldown_minutes=self.reject_cooldown_minutes,
                     apply_tracker_updates=False,
