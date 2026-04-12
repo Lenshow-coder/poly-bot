@@ -21,6 +21,7 @@ engine:
   loop_error_backoff_seconds: 5
   precheck_liquidity: false
   trade_log_path: data/trades.csv
+  max_scrape_age_seconds: 600
   ws_enabled: false
   ws_ping_interval: 20
   mark_cooldown_on_reject: true

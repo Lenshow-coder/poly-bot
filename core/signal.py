@@ -71,13 +71,13 @@ def evaluate_signals(
                 and fv.best_book_implied_prob > 0
             ):
                 relative_gap = (
-                    (pm.best_ask - fv.best_book_implied_prob)
+                    (fv.best_book_implied_prob - pm.best_ask)
                     / fv.best_book_implied_prob
                 )
                 if relative_gap < trade_params.sportsbook_buffer:
                     logger.debug(
-                        f"Buffer skip {fv.outcome_name}: poly_ask={pm.best_ask:.3f} "
-                        f"best_book={fv.best_book_implied_prob:.3f} "
+                        f"Buffer skip {fv.outcome_name}: best_book={fv.best_book_implied_prob:.3f} "
+                        f"poly_ask={pm.best_ask:.3f} "
                         f"gap={relative_gap:.1%} < buffer={trade_params.sportsbook_buffer:.1%}"
                     )
                     continue

@@ -13,11 +13,6 @@ from scrapers.csv_scraper import CsvScraper
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _run(coro):
-    """Synchronously run an async coroutine."""
-    return asyncio.get_event_loop().run_until_complete(coro)
-
-
 def _write_csv(tmp_dir: str, content: str, filename: str = "odds.csv") -> str:
     path = os.path.join(tmp_dir, filename)
     with open(path, "w", newline="") as f:
@@ -47,7 +42,7 @@ def test_scrape_basic():
     with tempfile.TemporaryDirectory() as d:
         path = _write_csv(d, VALID_CSV)
         scraper = CsvScraper(name="csv", interval=60, path=path)
-        result = _run(scraper.scrape())
+        result = asyncio.run(scraper.scrape())
 
     assert "Stanley Cup Winner" in result.events
     event = result.events["Stanley Cup Winner"]
@@ -62,7 +57,7 @@ def test_scrape_sportsbook_lowercased():
     with tempfile.TemporaryDirectory() as d:
         path = _write_csv(d, VALID_CSV)
         scraper = CsvScraper(name="csv", interval=60, path=path)
-        result = _run(scraper.scrape())
+        result = asyncio.run(scraper.scrape())
 
     books = [
         bo.sportsbook
@@ -78,7 +73,7 @@ def test_scrape_odds_values():
     with tempfile.TemporaryDirectory() as d:
         path = _write_csv(d, VALID_CSV)
         scraper = CsvScraper(name="csv", interval=60, path=path)
-        result = _run(scraper.scrape())
+        result = asyncio.run(scraper.scrape())
 
     leafs = result.events["Stanley Cup Winner"].outcomes["Toronto Maple Leafs"]
     dk = next(bo for bo in leafs if bo.sportsbook == "draftkings")
@@ -90,7 +85,7 @@ def test_scrape_timestamp_parsed():
     with tempfile.TemporaryDirectory() as d:
         path = _write_csv(d, VALID_CSV)
         scraper = CsvScraper(name="csv", interval=60, path=path)
-        result = _run(scraper.scrape())
+        result = asyncio.run(scraper.scrape())
 
     assert result.timestamp.year == 2026
     assert result.timestamp.month == 4
@@ -112,7 +107,7 @@ timestamp,sport,sportsbook,market,team,odds
     with tempfile.TemporaryDirectory() as d:
         path = _write_csv(d, csv_data)
         scraper = CsvScraper(name="csv", interval=60, path=path)
-        result = _run(scraper.scrape())
+        result = asyncio.run(scraper.scrape())
 
     assert len(result.events) == 2
     assert "Stanley Cup Winner" in result.events
@@ -134,7 +129,7 @@ timestamp,sport,sportsbook,market,team,odds
     with tempfile.TemporaryDirectory() as d:
         path = _write_csv(d, csv_data)
         scraper = CsvScraper(name="csv", interval=60, path=path)
-        result = _run(scraper.scrape())
+        result = asyncio.run(scraper.scrape())
 
     assert result.timestamp.year == 2026
     assert result.timestamp.month == 4
@@ -173,14 +168,14 @@ timestamp,sport,sportsbook,market,team,odds
     with tempfile.TemporaryDirectory() as d:
         path = _write_csv(d, initial)
         scraper = CsvScraper(name="csv", interval=60, path=path)
-        first = _run(scraper.scrape())
+        first = asyncio.run(scraper.scrape())
 
         _append_csv(
             path,
             "04/01/2026 11:58,NBA,FanDuel,NBA Champion,Team C,5.20\n"
             "04/01/2026 12:01,NBA,FanDuel,NBA Champion,Team C,4.80\n",
         )
-        second = _run(scraper.scrape())
+        second = asyncio.run(scraper.scrape())
 
     assert first.events["Stanley Cup Winner"].timestamp == datetime(
         2026, 4, 1, 12, 0, tzinfo=timezone.utc
@@ -213,9 +208,9 @@ timestamp,sport,sportsbook,market,team,odds
     with tempfile.TemporaryDirectory() as d:
         path = _write_csv(d, initial)
         scraper = CsvScraper(name="csv", interval=60, path=path)
-        _run(scraper.scrape())
+        asyncio.run(scraper.scrape())
         _write_csv(d, replacement)
-        result = _run(scraper.scrape())
+        result = asyncio.run(scraper.scrape())
 
     assert "Stanley Cup Winner" not in result.events
     assert "NBA Champion" in result.events
@@ -231,7 +226,7 @@ timestamp,sport,sportsbook,market,team,odds
 def test_scrape_file_not_found():
     """Missing file returns empty ScrapedOdds, not an exception."""
     scraper = CsvScraper(name="csv", interval=60, path="/nonexistent/odds.csv")
-    result = _run(scraper.scrape())
+    result = asyncio.run(scraper.scrape())
     assert len(result.events) == 0
     assert result.timestamp is not None
 
@@ -242,7 +237,7 @@ def test_scrape_empty_file():
     with tempfile.TemporaryDirectory() as d:
         path = _write_csv(d, csv_data)
         scraper = CsvScraper(name="csv", interval=60, path=path)
-        result = _run(scraper.scrape())
+        result = asyncio.run(scraper.scrape())
 
     assert len(result.events) == 0
 
@@ -258,7 +253,7 @@ timestamp,sport,sportsbook,market,team,odds
     with tempfile.TemporaryDirectory() as d:
         path = _write_csv(d, csv_data)
         scraper = CsvScraper(name="csv", interval=60, path=path)
-        result = _run(scraper.scrape())
+        result = asyncio.run(scraper.scrape())
 
     event = result.events["Stanley Cup Winner"]
     assert "Toronto Maple Leafs" in event.outcomes
@@ -275,7 +270,7 @@ timestamp,sport,sportsbook,market,team,odds
     with tempfile.TemporaryDirectory() as d:
         path = _write_csv(d, csv_data)
         scraper = CsvScraper(name="csv", interval=60, path=path)
-        result = _run(scraper.scrape())
+        result = asyncio.run(scraper.scrape())
 
     event = result.events["Stanley Cup Winner"]
     assert "Team A" not in event.outcomes
@@ -291,6 +286,6 @@ timestamp,sport,book_name,event,player,price
     with tempfile.TemporaryDirectory() as d:
         path = _write_csv(d, csv_data)
         scraper = CsvScraper(name="csv", interval=60, path=path)
-        result = _run(scraper.scrape())
+        result = asyncio.run(scraper.scrape())
 
     assert len(result.events) == 0

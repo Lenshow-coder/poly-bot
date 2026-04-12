@@ -23,6 +23,8 @@ STOP_KILL = "kill"
 HEARTBEAT_SECONDS = 2.0
 GRACEFUL_TIMEOUT_SECONDS = 20.0
 
+_log_handles: dict[int, object] = {}
+
 
 def get_project_python() -> str:
     venv_python = ROOT_DIR / ".venv" / "Scripts" / "python.exe"
@@ -128,12 +130,12 @@ def launch_bot(mode: str) -> subprocess.Popen:
         kwargs["creationflags"] = 0x00000200  # CREATE_NEW_PROCESS_GROUP
 
     process = subprocess.Popen(cmd, **kwargs)
-    process._runner_log_handle = log_handle  # type: ignore[attr-defined]
+    _log_handles[process.pid] = log_handle
     return process
 
 
 def _close_process_log_handle(process: subprocess.Popen) -> None:
-    handle = getattr(process, "_runner_log_handle", None)
+    handle = _log_handles.pop(process.pid, None)
     if handle is not None:
         handle.close()
 

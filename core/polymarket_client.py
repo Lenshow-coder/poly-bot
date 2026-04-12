@@ -183,11 +183,35 @@ class PolymarketClient:
         else:
             raw = resp.__dict__ if hasattr(resp, "__dict__") else {"raw": str(resp)}
 
+        status = raw.get("status", "UNKNOWN")
+
+        filled_size = 0.0
+        for key in ("filledSize", "filled_size", "matchedSize"):
+            if key in raw:
+                try:
+                    filled_size = float(raw[key])
+                except (ValueError, TypeError):
+                    continue
+                break
+
+        filled_price = price
+        for key in ("filledPrice", "filled_price", "averagePrice", "avgPrice"):
+            if key in raw:
+                try:
+                    filled_price = float(raw[key])
+                except (ValueError, TypeError):
+                    continue
+                break
+
+        fill_statuses = {"MATCHED", "FILLED", "PARTIAL", "PARTIALLY_FILLED"}
+        if status.upper() not in fill_statuses:
+            filled_size = 0.0
+
         return OrderResult(
             order_id=raw.get("orderID", raw.get("id", "")),
-            status=raw.get("status", "UNKNOWN"),
-            filled_size=float(raw.get("filledSize", 0)),
-            filled_price=float(raw.get("filledPrice", price)),
+            status=status,
+            filled_size=filled_size,
+            filled_price=filled_price,
             timestamp=datetime.now(timezone.utc).isoformat(),
         )
 

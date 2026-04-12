@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import signal
+import sys
+from datetime import datetime, timezone
 
 from core.executor import Executor
 from core.polymarket_client import PolymarketClient
@@ -43,6 +45,9 @@ class Engine:
         )
         self.reject_cooldown_minutes = int(
             self.engine_cfg.get("reject_cooldown_minutes", 5)
+        )
+        self.max_scrape_age_seconds = int(
+            self.engine_cfg.get("max_scrape_age_seconds", 0)
         )
 
         self.tracker = PositionTracker()
@@ -115,6 +120,17 @@ class Engine:
             len(scraped_odds.events),
         )
 
+        if self.max_scrape_age_seconds > 0:
+            age = (datetime.now(timezone.utc) - scraped_odds.timestamp).total_seconds()
+            if age > self.max_scrape_age_seconds:
+                logger.warning(
+                    "Stale scrape data skipped scraper=%s age=%.0fs max=%ds",
+                    scraper_name,
+                    age,
+                    self.max_scrape_age_seconds,
+                )
+                return
+
         for plugin in self.plugins:
             mapped_odds = plugin.extract_odds(scraped_odds)
             if not mapped_odds:
@@ -131,10 +147,10 @@ class Engine:
             if not fair_values:
                 continue
 
-            prices = {}
-            for fv in fair_values:
+            async def _fetch_price(fv):
                 try:
-                    prices[fv.token_id] = await asyncio.to_thread(self.client.get_prices, fv.token_id)
+                    price = await asyncio.to_thread(self.client.get_prices, fv.token_id)
+                    return fv.token_id, price
                 except Exception as exc:
                     logger.warning(
                         "Price fetch failed token=%s outcome=%s error=%s",
@@ -142,6 +158,10 @@ class Engine:
                         fv.outcome_name,
                         str(exc),
                     )
+                    return fv.token_id, None
+
+            results = await asyncio.gather(*[_fetch_price(fv) for fv in fair_values])
+            prices = {tid: price for tid, price in results if price is not None}
 
             signals = evaluate_signals(
                 fair_values=fair_values,
@@ -186,16 +206,12 @@ class Engine:
                 result = await self.executor.execute(
                     signal=signal,
                     trade_params=trade_params,
-                    tracker=None,
                     adjusted_size_usd=decision.adjusted_size_usd,
                     dry_run=self.dry_run,
                     scrape_timestamp=scrape_timestamp,
                     sportsbook_odds=sportsbook_odds,
                     sources_books=sources_books,
                     order_type_override=(trade_params.order_type or self.trade_default_order_type),
-                    mark_cooldown_on_reject=self.mark_cooldown_on_reject,
-                    reject_cooldown_minutes=self.reject_cooldown_minutes,
-                    apply_tracker_updates=False,
                     held_shares=held_shares,
                 )
 
@@ -252,8 +268,13 @@ class Engine:
             try:
                 loop.add_signal_handler(sig, self.stop)
             except (NotImplementedError, RuntimeError):
-                # Some environments (e.g. Windows event loop policies) do not support this.
-                continue
+                pass
+
+        if sys.platform == "win32":
+            def _win_handler(signum, frame):
+                loop.call_soon_threadsafe(self.stop)
+
+            signal.signal(signal.SIGINT, _win_handler)
 
     @staticmethod
     def _sportsbook_odds_for_signal(

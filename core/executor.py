@@ -7,7 +7,6 @@ from pathlib import Path
 
 from core.models import ExecutionResult, OrderResult, Signal
 from core.polymarket_client import PolymarketClient
-from core.position_tracker import PositionTracker
 from markets.base import TradeParams
 
 logger = logging.getLogger("poly-bot.executor")
@@ -81,16 +80,12 @@ class Executor:
         self,
         signal: Signal,
         trade_params: TradeParams,
-        tracker: PositionTracker | None,
         adjusted_size_usd: float,
         dry_run: bool = False,
         scrape_timestamp: datetime | None = None,
         sportsbook_odds: dict[str, float] | None = None,
         sources_books: list[str] | None = None,
         order_type_override: str | None = None,
-        mark_cooldown_on_reject: bool = False,
-        reject_cooldown_minutes: int | None = None,
-        apply_tracker_updates: bool = True,
         held_shares: float | None = None,
     ) -> ExecutionResult:
         resolved_order_type = (order_type_override or trade_params.order_type or "FOK").upper()
@@ -122,7 +117,6 @@ class Executor:
             signal=signal,
             side=side,
             limit_price=price,
-            tracker=tracker,
             adjusted_size_usd=adjusted_size_usd,
             held_shares=held_shares,
         )
@@ -193,9 +187,7 @@ class Executor:
             )
             return result
 
-        placed_attempt = False
         try:
-            placed_attempt = True
             order_result = await asyncio.to_thread(
                 self.client.place_order,
                 signal.token_id,
@@ -205,26 +197,6 @@ class Executor:
                 resolved_order_type,
             )
             result = self._from_order_result(signal, side, requested_shares, price, order_result)
-            if apply_tracker_updates and tracker is not None and result.filled_shares > 0:
-                tracker.apply_fill(
-                    token_id=signal.token_id,
-                    outcome_name=signal.outcome_name,
-                    event_name=signal.event_name,
-                    side=side,
-                    shares=result.filled_shares,
-                    price=result.avg_fill_price,
-                )
-                tracker.mark_traded(signal.token_id, trade_params.cooldown_minutes)
-            elif (
-                apply_tracker_updates
-                and tracker is not None
-                and mark_cooldown_on_reject
-                and placed_attempt
-            ):
-                tracker.mark_traded(
-                    signal.token_id,
-                    reject_cooldown_minutes or trade_params.cooldown_minutes,
-                )
         except Exception as exc:
             logger.exception(
                 "Order placement failed token=%s side=%s reason=%s",
@@ -242,16 +214,6 @@ class Executor:
                 avg_fill_price=0.0,
                 reason=f"exception:{exc}",
             )
-            if (
-                apply_tracker_updates
-                and tracker is not None
-                and mark_cooldown_on_reject
-                and placed_attempt
-            ):
-                tracker.mark_traded(
-                    signal.token_id,
-                    reject_cooldown_minutes or trade_params.cooldown_minutes,
-                )
 
         self._log_trade_attempt(
             signal=signal,
@@ -275,20 +237,13 @@ class Executor:
         signal: Signal,
         side: str,
         limit_price: float,
-        tracker: PositionTracker | None,
         adjusted_size_usd: float,
         held_shares: float | None = None,
     ) -> float:
         if side == "BUY":
             return adjusted_size_usd / limit_price
 
-        if held_shares is not None:
-            position_size = held_shares
-        elif tracker is not None:
-            pos = tracker.get_position(signal.token_id)
-            position_size = pos.size if pos is not None else 0.0
-        else:
-            position_size = 0.0
+        position_size = held_shares if held_shares is not None else 0.0
 
         if position_size <= 0:
             return 0.0

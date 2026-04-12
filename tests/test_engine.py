@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -171,3 +171,20 @@ async def test_scraper_exception_isolated(monkeypatch):
 
     monkeypatch.setattr("core.engine.asyncio.sleep", _sleep)
     await engine._scraper_loop(BadScraper())
+
+
+@pytest.mark.asyncio
+async def test_stale_scrape_data_skipped(tmp_path):
+    cfg = _config()
+    cfg["engine"]["max_scrape_age_seconds"] = 600
+    plugin = DummyPlugin(return_mapped=True)
+    engine = Engine(cfg, DummyClient(), [plugin], [])
+    engine.executor.trade_logger.path = tmp_path / "trades.csv"
+    engine.executor.trade_logger._ensure_header()
+
+    stale = ScrapedOdds(
+        timestamp=datetime.now(timezone.utc) - timedelta(seconds=900),
+        events={"Event A": EventOdds("Event A", outcomes={"Team A": [BookOdds("fanduel", 4.0)]})},
+    )
+    await engine.process_scraper_result(stale, "csv")
+    assert plugin.extract_calls == 0

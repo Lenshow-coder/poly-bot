@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "grep -q '\"command\"[^}]*git push' && echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"IMPORTANT: Run /update-docs first to update CLAUDE.md and notes/plan.md to reflect the current codebase state, then re-run the push.\"}}' || true",
+            "timeout": 5,
+            "statusMessage": "Checking for git push..."
+          }
+        ]
+      }
+    ]
+  }
+}

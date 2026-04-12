@@ -171,14 +171,14 @@ def test_signal_sell():
 # --- sportsbook buffer tests ---
 
 def test_buffer_blocks_signal():
-    """Poly ask barely above best book implied prob → buffer blocks the signal.
+    """Best book implied prob too close to poly ask → buffer blocks the signal.
 
-    best_book_implied_prob=0.17, poly_ask=0.18
-    relative gap = (0.18 - 0.17) / 0.17 ≈ 5.9%
+    best_book_implied_prob=0.19, poly_ask=0.18
+    relative gap = (0.19 - 0.18) / 0.19 ≈ 5.3%
     With buffer=0.10 (10%), gap is too small → no signal.
     """
     fv = [OutcomeFairValue("Team A", "tok1", 0.25, 4,
-                           best_book_implied_prob=0.17, best_book_name="book1")]
+                           best_book_implied_prob=0.19, best_book_name="book1")]
     prices = {"tok1": PriceInfo(best_bid=0.17, best_ask=0.18, midpoint=0.175)}
     tp = _make_trade_params(sportsbook_buffer=0.10)
     signals = evaluate_signals(fv, prices, tp, 1000, "Test Event")
@@ -187,14 +187,14 @@ def test_buffer_blocks_signal():
 
 
 def test_buffer_allows_signal():
-    """Poly ask well above best book implied prob → buffer passes.
+    """Best book implied prob well above poly ask → buffer passes.
 
-    best_book_implied_prob=0.10, poly_ask=0.18
-    relative gap = (0.18 - 0.10) / 0.10 = 80%
+    best_book_implied_prob=0.25, poly_ask=0.18
+    relative gap = (0.25 - 0.18) / 0.25 = 28%
     With buffer=0.05 (5%), gap is large enough → signal emitted.
     """
     fv = [OutcomeFairValue("Team A", "tok1", 0.25, 4,
-                           best_book_implied_prob=0.10, best_book_name="book1")]
+                           best_book_implied_prob=0.25, best_book_name="book1")]
     prices = {"tok1": PriceInfo(best_bid=0.17, best_ask=0.18, midpoint=0.175)}
     tp = _make_trade_params(sportsbook_buffer=0.05)
     signals = evaluate_signals(fv, prices, tp, 1000, "Test Event")
