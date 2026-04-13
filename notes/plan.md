@@ -202,7 +202,8 @@ async def run():
             if not mapped_odds:
                 continue
             fair_values = plugin.compute_fair_values(mapped_odds)
-            prices = {tid: client.get_prices(tid) for tid in plugin.get_token_ids()}
+            books = {fv.token_id: client.get_order_book(fv.token_id) for fv in fair_values}
+            prices = extract_prices(books)  # PriceInfo from book top-of-book
 
             signals = evaluate_signals(
                 fair_values, prices, plugin.get_trade_params(),
@@ -210,6 +211,13 @@ async def run():
                 event_name=plugin.get_name(),
             )
             for signal in signals:
+                # Book sweep: walk ask/bid ladder for depth-aware sizing
+                book = books[signal.token_id]
+                sweep = sweep_asks(book.asks, signal.fair_value, ...)  # or sweep_bids
+                # Re-run Kelly against VWAP, cap shares to available depth
+                signal.size_usd = recalculated_kelly
+                signal.max_price = sweep.worst_price
+
                 if risk_mgr.approve(signal, position_tracker):
                     if not config["engine"].get("dry_run"):
                         await executor.execute(signal)
@@ -1079,6 +1087,10 @@ sportsbook_signals:
   abs_edge_threshold: 0.01
   min_sources: 3
 
+book_sweep:
+  max_levels: 10              # max ask/bid levels to walk
+  max_sweep_price: 0.85       # absolute price cap regardless of edge
+
 scrapers:
   - name: csv
     interval: 60              # seconds — used when Phase 3 engine schedules loops
@@ -1251,7 +1263,7 @@ Alerts are **non-blocking** — if Telegram is unreachable, log the failure and 
 | ----- | ------ | ----- |
 | **1** | **Done** | `pyproject.toml` + `uv`, `core/models.py`, `core/polymarket_client.py` (REST CLOB/Gamma/data API, Web3 balances + approvals, `place_order`), `core/state.py`, `core/utils.py`, `test_connection.py`. Market WebSocket **not** integrated into the client — verified via `test_connection.py --ws-test` only. |
 | **2** | **Done** | `scrapers/models.py`, `scrapers/base.py`, `scrapers/csv_scraper.py`, `markets/base.py`, `markets/fair_value.py`, `markets/futures_plugin.py`, `markets/configs/nhl_stanley_cup.yaml`, `core/signal.py`, `core/sportsbook_signal.py`, `main.py` dry-run pipeline, tests `test_fair_value`, `test_signal`, `test_sportsbook_signal`. No stub scraper in repo. Scraper `interval` is stored but **not** used until Phase 3 loops. |
-| **3** | **Next** | Live trading loop, executor wrapping `place_order`, risk enforcement, positions/P&L, CSV log, notifier, optional WS cache in client. |
+| **3** | **Done** | `core/engine.py` (async scraper loops, reconciliation, signal handlers), `core/executor.py`, `core/risk_manager.py`, `core/position_tracker.py`, `core/book_sweep.py` (order book sweep for depth-aware sizing), `runner/dashboard.py`, CSV trade logging. Book sweep walks ask/bid ladder to find fillable size within edge, re-runs Kelly against VWAP, and caps shares to available depth. |
 | **4–5** | Planned | As below. |
 
 ### Phase 1: Foundation (Polymarket Client + Data Models) — complete
@@ -1283,7 +1295,7 @@ Alerts are **non-blocking** — if Telegram is unreachable, log the failure and 
 8. ~~`--dry-run` / `engine.dry_run`~~ — single pass over scrapers in `main.py`
 9. **Tests:** ~~`tests/test_fair_value.py`, `test_signal.py`, `test_sportsbook_signal.py`~~
 
-### Phase 3: Execution, Risk & Monitoring — next
+### Phase 3: Execution, Risk & Monitoring — done
 
 **Goal:** Long-running bot, real execution, risk enforcement, observability.
 

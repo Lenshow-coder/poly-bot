@@ -1,6 +1,6 @@
 # Poly-Bot
 
-Market-taking bot for Polymarket. Compares prediction market prices against sportsbook-derived fair values; places directional FOK/FAK bets when edge exceeds threshold. Plugin-based: each market is a YAML config, no Python changes needed. Phases 1–2 done (dry-run pipeline), Phase 3 next (live execution). See `notes/plan.md` for full design doc.
+Market-taking bot for Polymarket. Compares prediction market prices against sportsbook-derived fair values; places directional FOK/FAK bets when edge exceeds threshold. Plugin-based: each market is a YAML config, no Python changes needed. Phases 1–3 done (dry-run pipeline + live execution with book sweep). See `notes/plan.md` for full design doc.
 
 ## Commands
 

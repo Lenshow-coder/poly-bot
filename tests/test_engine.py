@@ -8,6 +8,18 @@ from markets.base import OutcomeFairValue, TradeParams
 from scrapers.models import BookOdds, EventOdds, ScrapedOdds
 
 
+class _BookLevel:
+    def __init__(self, price, size):
+        self.price = price
+        self.size = size
+
+
+class _OrderBook:
+    def __init__(self, bids, asks):
+        self.bids = bids
+        self.asks = asks
+
+
 class DummyClient:
     def get_exchange_balance(self):
         return 100.0
@@ -15,8 +27,11 @@ class DummyClient:
     def get_positions(self):
         return []
 
-    def get_prices(self, token_id: str):
-        return PriceInfo(best_bid=0.2, best_ask=0.21, midpoint=0.205)
+    def get_order_book(self, token_id: str):
+        return _OrderBook(
+            bids=[_BookLevel(0.2, 500)],
+            asks=[_BookLevel(0.21, 500)],
+        )
 
 
 class DummyPlugin:

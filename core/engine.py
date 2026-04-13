@@ -4,11 +4,14 @@ import signal
 import sys
 from datetime import datetime, timezone
 
+from core.book_sweep import sweep_asks, sweep_bids
 from core.executor import Executor
+from core.models import PriceInfo
 from core.polymarket_client import PolymarketClient
 from core.position_tracker import PositionTracker
 from core.risk_manager import RiskManager
-from core.signal import evaluate_signals
+from core.signal import evaluate_signals, kelly_bet_size
+from scrapers.csv_scraper import CsvScraper
 
 logger = logging.getLogger("poly-bot.engine")
 
@@ -49,6 +52,10 @@ class Engine:
         self.max_scrape_age_seconds = int(
             self.engine_cfg.get("max_scrape_age_seconds", 0)
         )
+
+        sweep_cfg = config.get("book_sweep", {})
+        self.sweep_max_levels = int(sweep_cfg.get("max_levels", 10))
+        self.sweep_max_price = float(sweep_cfg.get("max_sweep_price", 0.85))
 
         self.tracker = PositionTracker()
         self.risk_manager = RiskManager(self.risk_cfg)
@@ -93,13 +100,34 @@ class Engine:
         self._stop_event.set()
 
     async def _scraper_loop(self, scraper) -> None:
-        logger.info(
-            "Starting scraper loop name=%s interval=%ss",
-            scraper.get_name(),
-            scraper.interval,
+        poll_iv = (
+            scraper.poll_csv_seconds
+            if isinstance(scraper, CsvScraper) and scraper.use_csv_change_polling()
+            else None
         )
+        if poll_iv is not None:
+            logger.info(
+                "Starting scraper loop name=%s mode=csv_change poll_csv_seconds=%ss",
+                scraper.get_name(),
+                poll_iv,
+            )
+        else:
+            logger.info(
+                "Starting scraper loop name=%s mode=interval interval=%ss",
+                scraper.get_name(),
+                scraper.interval,
+            )
+        sleep_poll = max(1, poll_iv) if poll_iv is not None else None
         while not self._stop_event.is_set():
             try:
+                if isinstance(scraper, CsvScraper) and scraper.use_csv_change_polling():
+                    if scraper.has_new_csv_data():
+                        scraped = await scraper.scrape()
+                        await self.process_scraper_result(scraped, scraper.get_name())
+                        scraper.persist_csv_poll_state()
+                    await asyncio.sleep(sleep_poll)
+                    continue
+
                 scraped = await scraper.scrape()
                 await self.process_scraper_result(scraped, scraper.get_name())
                 await asyncio.sleep(scraper.interval)
@@ -147,10 +175,16 @@ class Engine:
             if not fair_values:
                 continue
 
-            async def _fetch_price(fv):
+            async def _fetch_book(fv):
                 try:
-                    price = await asyncio.to_thread(self.client.get_prices, fv.token_id)
-                    return fv.token_id, price
+                    book = await asyncio.to_thread(self.client.get_order_book, fv.token_id)
+                    bids = getattr(book, "bids", None) or []
+                    asks = getattr(book, "asks", None) or []
+                    best_bid = float(bids[0].price) if bids else None
+                    best_ask = float(asks[0].price) if asks else None
+                    midpoint = round((best_bid + best_ask) / 2, 4) if best_bid and best_ask else None
+                    price = PriceInfo(best_bid=best_bid, best_ask=best_ask, midpoint=midpoint)
+                    return fv.token_id, price, book
                 except Exception as exc:
                     logger.warning(
                         "Price fetch failed token=%s outcome=%s error=%s",
@@ -158,10 +192,11 @@ class Engine:
                         fv.outcome_name,
                         str(exc),
                     )
-                    return fv.token_id, None
+                    return fv.token_id, None, None
 
-            results = await asyncio.gather(*[_fetch_price(fv) for fv in fair_values])
-            prices = {tid: price for tid, price in results if price is not None}
+            results = await asyncio.gather(*[_fetch_book(fv) for fv in fair_values])
+            prices = {tid: price for tid, price, _ in results if price is not None}
+            books = {tid: book for tid, _, book in results if book is not None}
 
             signals = evaluate_signals(
                 fair_values=fair_values,
@@ -177,6 +212,76 @@ class Engine:
             event_token_ids = set(plugin.get_token_ids())
             trade_params = plugin.get_trade_params()
             for signal in signals:
+                # ── Book sweep: refine size and price using order book depth ──
+                if signal.token_id in books:
+                    book = books[signal.token_id]
+                    if signal.side == "BUY":
+                        asks = getattr(book, "asks", None) or []
+                        sweep = sweep_asks(
+                            asks=asks,
+                            fair_value=signal.fair_value,
+                            edge_threshold=trade_params.edge_threshold,
+                            max_levels=self.sweep_max_levels,
+                            max_price_cap=self.sweep_max_price,
+                        )
+                    else:
+                        bids = getattr(book, "bids", None) or []
+                        sweep = sweep_bids(
+                            bids=bids,
+                            fair_value=signal.fair_value,
+                            edge_threshold=trade_params.edge_threshold,
+                            max_levels=self.sweep_max_levels,
+                            min_price_floor=1.0 - self.sweep_max_price,
+                        )
+
+                    if sweep.executable_shares == 0:
+                        logger.info(
+                            "sweep_skip token=%s side=%s reason=no_depth_with_edge",
+                            signal.token_id,
+                            signal.side,
+                        )
+                        continue
+
+                    # Re-run Kelly against VWAP
+                    kelly_usd = kelly_bet_size(
+                        fair_prob=signal.fair_value,
+                        market_price=sweep.vwap,
+                        bankroll=self.kelly_bankroll,
+                        kelly_fraction=trade_params.kelly_fraction,
+                        min_bet=trade_params.min_bet_size,
+                        max_bet=trade_params.max_bet_size,
+                    )
+                    if kelly_usd <= 0:
+                        logger.info(
+                            "sweep_skip token=%s side=%s reason=kelly_zero_at_vwap vwap=%.4f",
+                            signal.token_id,
+                            signal.side,
+                            sweep.vwap,
+                        )
+                        continue
+
+                    kelly_shares = kelly_usd / sweep.vwap
+                    capped_shares = min(kelly_shares, sweep.executable_shares)
+                    signal.size_usd = round(capped_shares * sweep.vwap, 4)
+                    signal.market_price = sweep.vwap
+                    signal.edge = sweep.edge_at_vwap
+                    if signal.side == "BUY":
+                        signal.max_price = sweep.worst_price
+                    else:
+                        signal.min_price = sweep.worst_price
+
+                    logger.info(
+                        "sweep_applied token=%s side=%s levels=%d vwap=%.4f "
+                        "worst=%.4f shares=%.4f edge=%.4f",
+                        signal.token_id,
+                        signal.side,
+                        sweep.levels_used,
+                        sweep.vwap,
+                        sweep.worst_price,
+                        capped_shares,
+                        sweep.edge_at_vwap,
+                    )
+
                 held_shares = None
                 async with self._tracker_lock:
                     decision = self.risk_manager.approve(

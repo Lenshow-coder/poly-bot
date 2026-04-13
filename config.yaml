@@ -63,8 +63,14 @@ sportsbook_signals:
   edge_threshold: 0.1
   abs_edge_threshold: 0.01
   min_sources: 3
+book_sweep:
+  max_levels: 10
+  max_sweep_price: 0.85
 scrapers:
 - name: csv
+  poll_mode: interval
+  poll_csv_seconds: 5
+  tail_state_path: data/csv_poll_state.json
   interval: 300
   path: data/normalized_odds.csv
 enabled_markets:
