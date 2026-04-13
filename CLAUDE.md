@@ -32,6 +32,10 @@ Hardcoded protocol constants (not user-tunable) exist only in `core/polymarket_c
 - **Free public Polygon RPCs are unreliable**: Use Alchemy.
 - **Neg-risk markets**: CLOB raw prices may differ from Gamma effective prices. Use Gamma `bestAsk` to verify edge.
 
+## Rules
+
+- Before any `git push`, always run `/update-docs` first to update `CLAUDE.md` and `notes/plan.md`, then push.
+
 ## Before Writing Code
 
 - Run an assumptions audit after each implementation phase
