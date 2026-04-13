@@ -92,6 +92,12 @@ def load_scrapers(config):
                 name=scraper_cfg["name"],
                 interval=scraper_cfg["interval"],
                 path=scraper_cfg["path"],
+                poll_mode=scraper_cfg.get("poll_mode", "interval"),
+                poll_csv_seconds=scraper_cfg.get(
+                    "poll_csv_seconds",
+                    scraper_cfg.get("poll_interval_seconds"),
+                ),
+                tail_state_path=scraper_cfg.get("tail_state_path"),
             ))
         elif scraper_cfg["name"] not in KNOWN_SCRAPERS:
             logger.warning(f"Unknown scraper: '{scraper_cfg['name']}' — skipping")

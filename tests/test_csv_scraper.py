@@ -220,6 +220,115 @@ timestamp,sport,sportsbook,market,team,odds
 
 
 # ---------------------------------------------------------------------------
+# Poll / tail trigger
+# ---------------------------------------------------------------------------
+
+def test_csv_poll_state_detects_append():
+    with tempfile.TemporaryDirectory() as d:
+        state_path = os.path.join(d, "state.json")
+        path = _write_csv(d, VALID_CSV)
+        scraper = CsvScraper(
+            name="csv",
+            interval=60,
+            path=path,
+            poll_csv_seconds=5,
+            tail_state_path=state_path,
+        )
+        assert scraper.has_new_csv_data() is True
+        scraper.persist_csv_poll_state()
+        assert scraper.has_new_csv_data() is False
+        _append_csv(
+            path,
+            "04/02/2026 10:00,NHL,DraftKings,Stanley Cup Winner,Boston Bruins,6.00\n",
+        )
+        assert scraper.has_new_csv_data() is True
+
+
+def test_csv_poll_state_survives_restart():
+    with tempfile.TemporaryDirectory() as d:
+        state_path = os.path.join(d, "state.json")
+        path = _write_csv(d, VALID_CSV)
+        s1 = CsvScraper(
+            name="csv",
+            interval=60,
+            path=path,
+            poll_csv_seconds=5,
+            tail_state_path=state_path,
+        )
+        s1.persist_csv_poll_state()
+        s2 = CsvScraper(
+            name="csv",
+            interval=60,
+            path=path,
+            poll_csv_seconds=5,
+            tail_state_path=state_path,
+        )
+        assert s2.has_new_csv_data() is False
+
+
+def test_csv_poll_state_back_compat_old_timestamp_state():
+    with tempfile.TemporaryDirectory() as d:
+        state_path = os.path.join(d, "state.json")
+        path = _write_csv(d, VALID_CSV)
+        size = os.path.getsize(path)
+        with open(state_path, "w", encoding="utf-8") as f:
+            f.write(
+                '{"last_file_size": %d, "last_timestamp_raw": "04/01/2026 12:00"}'
+                % size
+            )
+        s = CsvScraper(
+            name="csv",
+            interval=60,
+            path=path,
+            poll_csv_seconds=5,
+            tail_state_path=state_path,
+        )
+        # Old state lacks mtime metadata, so first check should resync.
+        assert s.has_new_csv_data() is True
+        s.persist_csv_poll_state()
+        assert s.has_new_csv_data() is False
+
+
+def test_csv_poll_mode_interval_ignores_csv_change_trigger_path():
+    with tempfile.TemporaryDirectory() as d:
+        path = _write_csv(d, VALID_CSV)
+        s = CsvScraper(
+            name="csv",
+            interval=60,
+            path=path,
+            poll_mode="interval",
+            poll_csv_seconds=5,
+        )
+        assert s.use_csv_change_polling() is False
+
+
+def test_csv_poll_mode_csv_change_requires_poll_csv_seconds():
+    with tempfile.TemporaryDirectory() as d:
+        path = _write_csv(d, VALID_CSV)
+        s = CsvScraper(
+            name="csv",
+            interval=60,
+            path=path,
+            poll_mode="csv_change",
+            poll_csv_seconds=None,
+        )
+        assert s.use_csv_change_polling() is False
+
+
+def test_csv_poll_mode_csv_change_enabled_with_poll_csv_seconds():
+    with tempfile.TemporaryDirectory() as d:
+        path = _write_csv(d, VALID_CSV)
+        s = CsvScraper(
+            name="csv",
+            interval=60,
+            path=path,
+            poll_mode="csv_change",
+            poll_csv_seconds=5,
+        )
+        assert s.use_csv_change_polling() is True
+
+
+# ---------------------------------------------------------------------------
 # Error handling
 # ---------------------------------------------------------------------------
 

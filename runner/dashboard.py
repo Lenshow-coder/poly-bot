@@ -172,6 +172,26 @@ HTML_PAGE = """<!doctype html>
         </div>
       </div>
       <div class="settings-section">
+        <h4>scrapers[0]</h4>
+        <div class="settings-grid">
+          <div class="setting-item">
+            <label for="qsCsvPollMode">poll_mode <span class="info-wrap"><span class="info-dot">i</span><span class="info-tip">Toggle CSV trigger behavior. interval: run a full scrape every `interval` seconds. csv_change: check CSV metadata every `poll_csv_seconds`, and only scrape when size/mtime changed.</span></span></label>
+            <select id="qsCsvPollMode">
+              <option value="interval">interval</option>
+              <option value="csv_change">csv_change</option>
+            </select>
+          </div>
+          <div class="setting-item">
+            <label for="qsCsvIntervalSeconds">interval <span class="info-wrap"><span class="info-dot">i</span><span class="info-tip">Used in interval mode only: run a full CSV scrape every N seconds regardless of file changes.</span></span></label>
+            <input id="qsCsvIntervalSeconds" type="number" step="1" min="1">
+          </div>
+          <div class="setting-item">
+            <label for="qsCsvPollCsvSeconds">poll_csv_seconds <span class="info-wrap"><span class="info-dot">i</span><span class="info-tip">Used in csv_change mode only: how often to poll CSV metadata (size/mtime) for changes.</span></span></label>
+            <input id="qsCsvPollCsvSeconds" type="number" step="1" min="1">
+          </div>
+        </div>
+      </div>
+      <div class="settings-section">
         <h4>trade_defaults</h4>
         <div class="settings-grid">
           <div class="setting-item">
@@ -268,15 +288,6 @@ HTML_PAGE = """<!doctype html>
           <button class="btn btn-sm" type="button" onclick="setAllEnabledMarkets(false)">None</button>
         </div>
         <div id="qsEnabledMarketsOptions" class="checkbox-list"></div>
-      </div>
-      <div class="settings-section">
-        <h4>scrapers[0]</h4>
-        <div class="settings-grid">
-          <div class="setting-item">
-            <label for="qsCsvIntervalSeconds">interval <span class="info-wrap"><span class="info-dot">i</span><span class="info-tip">Seconds between runs for this scraper.</span></span></label>
-            <input id="qsCsvIntervalSeconds" type="number" step="1" min="1">
-          </div>
-        </div>
       </div>
     </div>
     <div class="btn-group" style="margin-top: 0;">
@@ -409,7 +420,9 @@ HTML_PAGE = """<!doctype html>
       setInputValue('qsSbEdgeThreshold', common.sportsbook_signals_edge_threshold);
       setInputValue('qsSbAbsEdgeThreshold', common.sportsbook_signals_abs_edge_threshold);
       setInputValue('qsSbMinSources', common.sportsbook_signals_min_sources);
+      setInputValue('qsCsvPollMode', common.csv_scraper_poll_mode);
       setInputValue('qsCsvIntervalSeconds', common.csv_scraper_interval_seconds);
+      setInputValue('qsCsvPollCsvSeconds', common.csv_scraper_poll_csv_seconds);
       renderEnabledMarkets(common.enabled_market_options || [], common.enabled_markets || []);
     }
 
@@ -434,7 +447,9 @@ HTML_PAGE = """<!doctype html>
         sportsbook_signals_edge_threshold: Number(document.getElementById('qsSbEdgeThreshold').value),
         sportsbook_signals_abs_edge_threshold: Number(document.getElementById('qsSbAbsEdgeThreshold').value),
         sportsbook_signals_min_sources: Number(document.getElementById('qsSbMinSources').value),
+        csv_scraper_poll_mode: String(document.getElementById('qsCsvPollMode').value || '').toLowerCase(),
         csv_scraper_interval_seconds: Number(document.getElementById('qsCsvIntervalSeconds').value),
+        csv_scraper_poll_csv_seconds: Number(document.getElementById('qsCsvPollCsvSeconds').value),
         enabled_markets: getSelectedEnabledMarkets(),
       };
     }
@@ -747,7 +762,13 @@ def _get_csv_scraper(config: dict) -> dict:
     for scraper in scrapers:
         if isinstance(scraper, dict) and scraper.get("name") == "csv":
             return scraper
-    scraper = {"name": "csv", "interval": 300, "path": "data/normalized_odds.csv"}
+    scraper = {
+        "name": "csv",
+        "poll_mode": "interval",
+        "poll_csv_seconds": 5,
+        "interval": 300,
+        "path": "data/normalized_odds.csv",
+    }
     scrapers.append(scraper)
     return scraper
 
@@ -778,6 +799,11 @@ def extract_common_config(config: dict) -> dict:
     risk = config.get("risk", {}) if isinstance(config.get("risk"), dict) else {}
     sb = config.get("sportsbook_signals", {}) if isinstance(config.get("sportsbook_signals"), dict) else {}
     csv_scraper = _get_csv_scraper(config)
+    poll_mode = str(csv_scraper.get("poll_mode", "interval")).strip().lower()
+    if poll_mode == "metadata":
+        poll_mode = "csv_change"
+    if poll_mode not in {"interval", "csv_change"}:
+        poll_mode = "interval"
     price_range = trade.get("price_range")
     if isinstance(price_range, list) and len(price_range) == 2:
         price_min, price_max = price_range
@@ -812,7 +838,11 @@ def extract_common_config(config: dict) -> dict:
         "sportsbook_signals_edge_threshold": float(sb.get("edge_threshold", 0.1)),
         "sportsbook_signals_abs_edge_threshold": float(sb.get("abs_edge_threshold", 0.01)),
         "sportsbook_signals_min_sources": int(sb.get("min_sources", 2)),
+        "csv_scraper_poll_mode": poll_mode,
         "csv_scraper_interval_seconds": int(csv_scraper.get("interval", 300)),
+        "csv_scraper_poll_csv_seconds": int(
+            csv_scraper.get("poll_csv_seconds", csv_scraper.get("poll_interval_seconds", 5))
+        ),
         "enabled_markets": enabled_markets,
         "enabled_market_options": enabled_market_options,
     }
@@ -866,11 +896,23 @@ def apply_common_config(config: dict, common: dict) -> dict:
     )
     sb["min_sources"] = _to_int(common.get("sportsbook_signals_min_sources"), "sportsbook_signals_min_sources", 1)
 
+    csv_poll_mode = str(common.get("csv_scraper_poll_mode", "")).strip().lower()
+    if csv_poll_mode == "metadata":
+        csv_poll_mode = "csv_change"
+    if csv_poll_mode not in {"interval", "csv_change"}:
+        raise ValueError("csv_scraper_poll_mode must be 'interval' or 'csv_change'.")
+    csv_scraper["poll_mode"] = csv_poll_mode
     csv_scraper["interval"] = _to_int(
         common.get("csv_scraper_interval_seconds"),
         "csv_scraper_interval_seconds",
         1,
     )
+    csv_scraper["poll_csv_seconds"] = _to_int(
+        common.get("csv_scraper_poll_csv_seconds"),
+        "csv_scraper_poll_csv_seconds",
+        1,
+    )
+    csv_scraper.pop("poll_interval_seconds", None)
     if not isinstance(csv_scraper.get("path"), str):
         csv_scraper["path"] = "data/normalized_odds.csv"
 

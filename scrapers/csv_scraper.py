@@ -1,7 +1,9 @@
 """CSV scraper — reads normalized odds from a CSV file."""
 import csv
+import json
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 
 from scrapers.base import BaseScraper
 from scrapers.models import BookOdds, EventOdds, ScrapedOdds
@@ -18,15 +20,97 @@ class CsvScraper(BaseScraper):
     Reads incrementally from the last file offset for append-only CSVs.
     """
 
-    def __init__(self, name: str, interval: int, path: str):
+    def __init__(
+        self,
+        name: str,
+        interval: int,
+        path: str,
+        poll_mode: str = "interval",
+        poll_csv_seconds: int | None = None,
+        tail_state_path: str | None = None,
+    ):
         super().__init__(name, interval)
         self.path = path
+        self.poll_mode = (poll_mode or "interval").strip().lower()
+        if self.poll_mode == "metadata":
+            self.poll_mode = "csv_change"
+        if self.poll_mode not in {"interval", "csv_change"}:
+            logger.warning(
+                "Unknown poll_mode '%s' for CsvScraper; falling back to 'interval'",
+                self.poll_mode,
+            )
+            self.poll_mode = "interval"
+        self.poll_csv_seconds = poll_csv_seconds
+        self.tail_state_path = tail_state_path
+        self._poll_last_size: int = -1
+        self._poll_last_mtime_ns: int = -1
+        self._load_csv_poll_state_from_disk()
         self._latest_by_market: dict[str, datetime] = {}
         self._events: dict[str, dict[str, list[BookOdds]]] = {}
         self._fieldnames: list[str] | None = None
         self._file_position: int = 0
         self._next_row_number: int = 2
         self._initialized: bool = False
+
+    def _load_csv_poll_state_from_disk(self) -> None:
+        if not self.tail_state_path:
+            return
+        path = Path(self.tail_state_path)
+        if not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            self._poll_last_size = int(data.get("last_file_size", -1))
+            # Keep backward compatibility with old state files that only stored timestamp.
+            self._poll_last_mtime_ns = int(data.get("last_mtime_ns", -1))
+        except (OSError, ValueError, TypeError) as e:
+            logger.warning("Could not load CSV poll state %s: %s", path, e)
+
+    def use_csv_change_polling(self) -> bool:
+        """Whether this scraper should trigger from CSV metadata changes."""
+        return self.poll_mode == "csv_change" and self.poll_csv_seconds is not None
+
+    def has_new_csv_data(self) -> bool:
+        """True when CSV metadata changes (cheap polling trigger)."""
+        p = Path(self.path)
+        if not p.exists() or p.stat().st_size == 0:
+            return False
+        stat = p.stat()
+        size = stat.st_size
+        mtime_ns = stat.st_mtime_ns
+        if self._poll_last_size < 0 or self._poll_last_mtime_ns < 0:
+            return True
+        if size != self._poll_last_size:
+            return True
+        if mtime_ns != self._poll_last_mtime_ns:
+            return True
+        return False
+
+    def persist_csv_poll_state(self) -> None:
+        p = Path(self.path)
+        if p.exists():
+            stat = p.stat()
+            size = stat.st_size
+            mtime_ns = stat.st_mtime_ns
+        else:
+            size = 0
+            mtime_ns = -1
+        self._poll_last_size = size
+        self._poll_last_mtime_ns = mtime_ns
+        if not self.tail_state_path:
+            return
+        out = Path(self.tail_state_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(
+            json.dumps(
+                {
+                    "last_file_size": self._poll_last_size,
+                    "last_mtime_ns": self._poll_last_mtime_ns,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
 
     def _reset_state(self) -> None:
         self._latest_by_market = {}
