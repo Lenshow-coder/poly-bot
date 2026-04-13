@@ -1,7 +1,7 @@
 ---
 name: update-docs
 description: Update CLAUDE.md and notes/plan.md to reflect the current state of the codebase
-user_invocable: true
+user-invocable: true
 ---
 
 You are updating the project's two documentation files to match the current state of the codebase. You must ONLY edit `CLAUDE.md` and `notes/plan.md` — do not modify any source code, config files, or other files.
