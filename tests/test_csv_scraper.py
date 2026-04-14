@@ -93,6 +93,24 @@ def test_scrape_timestamp_parsed():
     assert result.timestamp.tzinfo == timezone.utc
 
 
+def test_scrape_prefers_iso_timestamp_and_falls_back_to_legacy():
+    """Supports both timestamp formats with ISO as default parser."""
+    csv_data = """\
+timestamp,sport,sportsbook,market,team,odds
+04/01/2026 12:00,NHL,DraftKings,Stanley Cup Winner,Team A,4.00
+2026-04-01 12:01:02,NHL,FanDuel,Stanley Cup Winner,Team B,5.00
+"""
+    with tempfile.TemporaryDirectory() as d:
+        path = _write_csv(d, csv_data)
+        scraper = CsvScraper(name="csv", interval=60, path=path)
+        result = asyncio.run(scraper.scrape())
+
+    assert result.events["Stanley Cup Winner"].timestamp == datetime(
+        2026, 4, 1, 12, 1, 2, tzinfo=timezone.utc
+    )
+    assert "Team B" in result.events["Stanley Cup Winner"].outcomes
+
+
 # ---------------------------------------------------------------------------
 # Multiple events
 # ---------------------------------------------------------------------------

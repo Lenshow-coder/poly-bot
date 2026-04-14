@@ -15,6 +15,8 @@ contracts:
   exchange: '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E'
   neg_risk_exchange: '0xC5d563A36AE78145C45a50134d48A1215220f80a'
   ctf: '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045'
+  neg_risk_adapter: '0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296'
+  proxy_wallet_factory: '0xaB45c5A4B0c941a2F231C04C3f49182e1A254052'
 engine:
   dry_run: true
   position_sync_interval: 60
@@ -58,6 +60,8 @@ sportsbook_weight_defaults:
   bet365: 1.0
   caesars: 1.0
   thescore: 1.0
+  betonline: 1.0
+  ozoon: 1.0
 sportsbook_signals:
   enabled: true
   edge_threshold: 0.1

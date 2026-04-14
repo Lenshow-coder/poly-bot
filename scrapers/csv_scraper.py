@@ -123,9 +123,7 @@ class CsvScraper(BaseScraper):
     def _parse_and_merge_row(self, row: dict, row_number: int) -> bool:
         try:
             row_ts_raw = row["timestamp"]
-            row_timestamp = datetime.strptime(
-                row_ts_raw, "%m/%d/%Y %H:%M"
-            ).replace(tzinfo=timezone.utc)
+            row_timestamp = self._parse_timestamp(row_ts_raw)
             market = row["market"]
             team = row["team"]
             sportsbook = row["sportsbook"].lower()
@@ -146,6 +144,19 @@ class CsvScraper(BaseScraper):
             BookOdds(sportsbook=sportsbook, decimal_odds=odds)
         )
         return True
+
+    @staticmethod
+    def _parse_timestamp(timestamp_raw: str) -> datetime:
+        # New rows are emitted as "YYYY-MM-DD HH:MM:SS"; keep legacy fallback
+        # for older rows that used "M/D/YYYY HH:MM".
+        for timestamp_format in ("%Y-%m-%d %H:%M:%S", "%m/%d/%Y %H:%M"):
+            try:
+                return datetime.strptime(timestamp_raw, timestamp_format).replace(
+                    tzinfo=timezone.utc
+                )
+            except ValueError:
+                continue
+        raise ValueError(f"Unsupported timestamp format: {timestamp_raw!r}")
 
     def _build_result(self) -> ScrapedOdds:
         scraped_events = {}
